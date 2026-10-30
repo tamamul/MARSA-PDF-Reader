@@ -294,16 +294,16 @@ class PdfDocumentView(context: Context) : View(context) {
                             bitmap.eraseColor(Color.WHITE)
 
                             page.render(
-                                bitmap,
-                                Rect(
-                                    0,
-                                    0,
-                                    targetWidth,
-                                    targetHeight
-                                ),
-                                null,
-                                PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY
-                            )
+    bitmap,
+    null,
+    null,
+    PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY
+)
+
+Log.d(
+    TAG,
+    "Render berhasil: halaman=$index, ukuran=${bitmap.width}x${bitmap.height}"
+)
 
                             result = bitmap
 
