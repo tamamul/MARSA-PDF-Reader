@@ -179,95 +179,88 @@ class PdfDocumentView(context: Context) : View(context) {
     // ============================================================
 
     private fun requestRenderIfNeeded(index: Int) {
-        if (isReleased) return
-        if (index < 0 || index >= pageSizes.size) return
-        if (bitmapCache.get(index) != null) return
-        if (!pendingRenders.add(index)) return   // sudah ada di antrean
+    if (isReleased) return
+    if (index < 0 || index >= pageSizes.size) return
+    if (bitmapCache.get(index) != null) return
+    if (!pendingRenders.add(index)) return
 
-        val renderer = pdf ?: run {
-            pendingRenders.remove(index)
-            return
-        }
+    val renderer = pdf ?: run {
+        pendingRenders.remove(index)
+        return
+    }
 
-        // Snapshot nilai UI-thread untuk dipakai di background
-        val snapshotZoom = zoom
-        val snapshotBaseWidth = basePageWidth()
+    val snapshotZoom = zoom
+    val snapshotBaseWidth = basePageWidth().coerceAtLeast(1f)
 
-        try {
-            renderExecutor.execute {
-                var result: Bitmap? = null
+    try {
+        renderExecutor.execute {
+            var result: Bitmap? = null
+            try {
+                if (isReleased) return@execute
+
+                val page = renderer.openPage(index)
                 try {
-                    if (isReleased) return@execute
+                    if (page.width <= 0 || page.height <= 0) return@execute
 
-                    val page = renderer.openPage(index)
-                    try {
-                        // Guard: ukuran halaman valid
-                        if (page.width <= 0 || page.height <= 0) {
-                            return@execute
-                        }
-
-                        val targetWidth = min(
-                            MAX_TARGET_WIDTH,
-                            (snapshotBaseWidth * snapshotZoom * 2f)
-                                .toInt()
-                                .coerceIn(MIN_TARGET_WIDTH, MAX_TARGET_WIDTH)
-                        )
-
-                        val ratio = page.height.toFloat() / page.width.toFloat()
-                        if (ratio.isNaN() || ratio.isInfinite() || ratio <= 0f) {
-                            return@execute
-                        }
-
-                        val targetHeight = (targetWidth * ratio)
+                    val targetWidth = min(
+                        MAX_TARGET_WIDTH,
+                        (snapshotBaseWidth * snapshotZoom * 2f)
                             .toInt()
-                            .coerceAtLeast(1)
+                            .coerceIn(MIN_TARGET_WIDTH, MAX_TARGET_WIDTH)
+                    )
+                    val ratio = page.height.toFloat() / page.width.toFloat()
+                    if (!ratio.isFinite() || ratio <= 0f) return@execute
 
-                        // RGB_565 = 2 byte/pixel, hemat memori
-                        val bmp = Bitmap.createBitmap(
-                            targetWidth,
-                            targetHeight,
-                            Bitmap.Config.RGB_565
-                        )
-                        bmp.eraseColor(Color.WHITE)
-                        page.render(
-                            bmp,
-                            null,
-                            null,
-                            PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY
-                        )
-                        result = bmp
-                    } finally {
-                        try { page.close() } catch (_: Exception) {}
-                    }
-                } catch (ise: IllegalStateException) {
-                    // Renderer sudah ditutup di tengah render — abaikan
-                    Log.w(TAG, "Renderer closed saat render halaman $index", ise)
-                } catch (t: Throwable) {
-                    Log.e(TAG, "Gagal render halaman $index", t)
+                    val targetHeight = (targetWidth * ratio).toInt().coerceAtLeast(1)
+
+                    // ARGB_8888 lebih aman daripada RGB_565
+                    val bmp = Bitmap.createBitmap(
+                        targetWidth, targetHeight, Bitmap.Config.ARGB_8888
+                    )
+                    bmp.eraseColor(Color.WHITE)
+
+                    // destClip EKSPLISIT — wajib di banyak device
+                    val destRect = android.graphics.Rect(0, 0, targetWidth, targetHeight)
+                    page.render(
+                        bmp,
+                        destRect,
+                        null,
+                        PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY
+                    )
+                    result = bmp
+                } finally {
+                    try { page.close() } catch (_: Exception) {}
                 }
-
+            } catch (ise: IllegalStateException) {
+                Log.w(TAG, "Renderer closed saat render halaman $index", ise)
+            } catch (t: Throwable) {
+                Log.e(TAG, "Gagal render halaman $index", t)
+            } finally {
+                // ✅ SELALU bersihkan pendingRenders, apapun yang terjadi
                 val finalBitmap = result
                 mainHandler.post {
                     pendingRenders.remove(index)
-
                     if (isReleased) {
                         finalBitmap?.recycle()
                         return@post
                     }
-
                     if (finalBitmap != null &&
                         !finalBitmap.isRecycled &&
                         index < pageSizes.size
                     ) {
                         bitmapCache.put(index, finalBitmap)
                         invalidate()
+                    } else {
+                        // Kalau render gagal, biar bisa dicoba lagi nanti
+                        invalidate()
                     }
                 }
             }
-        } catch (re: RejectedExecutionException) {
-            pendingRenders.remove(index)
         }
+    } catch (re: RejectedExecutionException) {
+        pendingRenders.remove(index)
     }
+}
 
     // ============================================================
     // Drawing
