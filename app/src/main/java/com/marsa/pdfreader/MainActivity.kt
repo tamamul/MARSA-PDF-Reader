@@ -95,7 +95,7 @@ class MainActivity : Activity() {
             text = "MARSA PDF Reader"
             textSize = 14f
             gravity = Gravity.CENTER
-            setTextColor(foreground)
+            setTextColor(this@MainActivity.foreground)
             maxLines = 1
             ellipsize = android.text.TextUtils.TruncateAt.MIDDLE
             typeface = android.graphics.Typeface.DEFAULT_BOLD
@@ -113,7 +113,7 @@ class MainActivity : Activity() {
             text = "☰"
             textSize = 27f
             gravity = Gravity.CENTER
-            setTextColor(foreground)
+            setTextColor(this@MainActivity.foreground)
             setOnClickListener { showMenu(this) }
         }
 
