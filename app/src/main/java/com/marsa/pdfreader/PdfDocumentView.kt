@@ -1,4 +1,3 @@
-
 package com.marsa.pdfreader
 
 import android.content.Context
@@ -6,6 +5,7 @@ import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
+import android.graphics.Rect
 import android.graphics.RectF
 import android.graphics.pdf.PdfRenderer
 import android.os.Handler
@@ -19,6 +19,8 @@ import android.view.View
 import android.widget.OverScroller
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
+import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 
@@ -26,9 +28,25 @@ class PdfDocumentView(context: Context) : View(context) {
 
     companion object {
         private const val TAG = "PdfDocumentView"
-        private const val MAX_WIDTH = 1800
-        private const val MIN_WIDTH = 320
+
+        // Resolusi bitmap maksimum (px). Lebih tinggi = lebih tajam saat zoom,
+        // tapi lebih boros RAM. 2400 cukup untuk HP modern.
+        private const val MAX_BITMAP_WIDTH = 2400
+        private const val MIN_BITMAP_WIDTH = 320
+
+        // Skala ekstra agar tidak blur saat user zoom sedikit di atas bucket.
+        private const val RENDER_SCALE_EXTRA = 1.35f
+
+        // Bucket zoom (step 0.25): 1.0, 1.25, 1.5, ..., 4.0
+        private const val ZOOM_BUCKET_STEP = 0.25f
+        private const val MIN_ZOOM = 1f
+        private const val MAX_ZOOM = 4f
+
+        // Debounce setelah pinch berhenti sebelum render ulang.
+        private const val ZOOM_DEBOUNCE_MS = 200L
     }
+
+    // ---------------- Renderer & metadata ----------------
 
     private val rendererLock = Any()
 
@@ -43,134 +61,158 @@ class PdfDocumentView(context: Context) : View(context) {
     @Volatile
     private var isReleased = false
 
+    // ---------------- State UI ----------------
+
     private var zoom = 1f
     private var scrollOffset = 0f
     private var lastY = 0f
     private var isScaling = false
 
+    // Titik fokus pinch (koordinat layar)
+    private var pinchFocusX = 0f
+    private var pinchFocusY = 0f
+    private var pinchStartZoom = 1f
+    private var pinchStartScroll = 0f
+
     private val pageGap = dp(12).toFloat()
     private val sidePadding = dp(12).toFloat()
 
+    // ---------------- Cache ----------------
+
+    // Key: (zoomBucket shl 32) or pageIndex  ->  Bitmap
+    private val bitmapCache: LruCache<Long, Bitmap>
+
+    private val pendingRenders: MutableSet<Long> = ConcurrentHashMap.newKeySet()
+
+    // ---------------- Threading ----------------
+
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val renderExecutor = Executors.newFixedThreadPool(2)
 
-    private val renderExecutor = Executors.newSingleThreadExecutor()
-
-    private val pendingRenders: MutableSet<Long> =
-        ConcurrentHashMap.newKeySet()
-
-    private val bitmapCache: LruCache<Int, Bitmap>
+    private val zoomDebounceTask = Runnable {
+        if (isReleased) return@Runnable
+        // Buang bitmap bucket lama untuk halaman yang pernah di-render,
+        // supaya dirender ulang di zoom baru.
+        // (Kunci lama tidak akan pernah dipakai lagi karena bucket berbeda.)
+        invalidate()
+    }
 
     private val scroller = OverScroller(context)
-
     private var velocityTracker: VelocityTracker? = null
 
-    private val pagePaint =
-        Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+    // ---------------- Paint ----------------
 
-    private val placeholderPaint =
-        Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.WHITE
-        }
+    private val pagePaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG).apply {
+        isFilterBitmap = true
+        isAntiAlias = true
+        isDither = true
+    }
 
-    private val scaleDetector =
-        ScaleGestureDetector(
-            context,
-            object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+    private val placeholderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        // Abu sangat terang, bukan putih — mengurangi efek "kedip putih"
+        color = Color.rgb(245, 245, 245)
+    }
 
-                override fun onScaleBegin(
-                    detector: ScaleGestureDetector
-                ): Boolean {
-                    isScaling = true
-                    scroller.abortAnimation()
-                    return true
-                }
+    private val scaleDetector = ScaleGestureDetector(
+        context,
+        object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
 
-                override fun onScale(
-                    detector: ScaleGestureDetector
-                ): Boolean {
+            override fun onScaleBegin(detector: ScaleGestureDetector): Boolean {
+                isScaling = true
+                scroller.abortAnimation()
 
-                    zoom = (zoom * detector.scaleFactor)
-                        .coerceIn(1f, 4f)
+                pinchFocusX = detector.focusX
+                pinchFocusY = detector.focusY
+                pinchStartZoom = zoom
+                pinchStartScroll = scrollOffset
 
-                    clampScroll()
-                    invalidate()
-
-                    return true
-                }
-
-                override fun onScaleEnd(
-                    detector: ScaleGestureDetector
-                ) {
-                    isScaling = false
-                }
+                mainHandler.removeCallbacks(zoomDebounceTask)
+                return true
             }
-        )
+
+            override fun onScale(detector: ScaleGestureDetector): Boolean {
+                val targetZoom = (zoom * detector.scaleFactor)
+                    .coerceIn(MIN_ZOOM, MAX_ZOOM)
+
+                // Zoom di sekitar titik fokus (focal point)
+                applyFocalZoom(targetZoom, pinchFocusX, pinchFocusY, pinchStartZoom, pinchStartScroll)
+
+                invalidate()
+                return true
+            }
+
+            override fun onScaleEnd(detector: ScaleGestureDetector) {
+                isScaling = false
+                mainHandler.removeCallbacks(zoomDebounceTask)
+                mainHandler.postDelayed(zoomDebounceTask, ZOOM_DEBOUNCE_MS)
+            }
+        }
+    )
 
     init {
-        val cacheKb =
-            (Runtime.getRuntime().maxMemory() / 1024 / 8)
-                .toInt()
-                .coerceAtLeast(4096)
+        val cacheKb = (Runtime.getRuntime().maxMemory() / 1024 / 6)
+            .toInt()
+            .coerceAtLeast(4096)
 
-        bitmapCache = object : LruCache<Int, Bitmap>(cacheKb) {
-            override fun sizeOf(key: Int, value: Bitmap): Int {
+        bitmapCache = object : LruCache<Long, Bitmap>(cacheKb) {
+            override fun sizeOf(key: Long, value: Bitmap): Int {
                 return (value.byteCount / 1024).coerceAtLeast(1)
+            }
+
+            override fun entryRemoved(
+                evicted: Boolean,
+                key: Long,
+                oldValue: Bitmap,
+                newValue: Bitmap?
+            ) {
+                if (evicted && oldValue !== newValue && !oldValue.isRecycled) {
+                    oldValue.recycle()
+                }
             }
         }
 
-        setLayerType(View.LAYER_TYPE_SOFTWARE, null)
         isFocusable = true
+        // LAYER_TYPE_SOFTWARE SENGAJA TIDAK DIPAKAI:
+        // drawBitmap di hardware canvas jauh lebih halus untuk teks.
     }
 
-    private fun dp(value: Int): Int {
-        return (value * resources.displayMetrics.density).toInt()
-    }
+    private fun dp(value: Int): Int =
+        (value * resources.displayMetrics.density).toInt()
 
-    // ==================================================
-    // RENDERER
-    // ==================================================
+    // ============================================================
+    // Public API
+    // ============================================================
 
     fun setRenderer(newRenderer: PdfRenderer?) {
-
         if (isReleased) return
 
         synchronized(rendererLock) {
-
             generation++
 
             pdf = null
             pendingRenders.clear()
             bitmapCache.evictAll()
-
             pageSizes.clear()
 
             scrollOffset = 0f
             zoom = 1f
-
             scroller.abortAnimation()
 
             if (newRenderer != null) {
-
                 try {
                     for (i in 0 until newRenderer.pageCount) {
-
                         val page = newRenderer.openPage(i)
-
                         try {
-                            pageSizes.add(
-                                Pair(page.width, page.height)
-                            )
+                            if (page.width > 0 && page.height > 0) {
+                                pageSizes.add(Pair(page.width, page.height))
+                            }
                         } finally {
                             page.close()
                         }
                     }
-
                     pdf = newRenderer
-
                 } catch (e: Exception) {
-
-                    Log.e(TAG, "Gagal membaca halaman PDF", e)
-
+                    Log.e(TAG, "Gagal membaca metadata PDF", e)
                     pageSizes.clear()
                     pdf = null
                 }
@@ -184,301 +226,247 @@ class PdfDocumentView(context: Context) : View(context) {
         zoom = 1f
         scrollOffset = 0f
         scroller.abortAnimation()
+        mainHandler.removeCallbacks(zoomDebounceTask)
         invalidate()
     }
 
-    // ==================================================
-    // UKURAN HALAMAN
-    // ==================================================
+    // ============================================================
+    // Geometri
+    // ============================================================
 
-    private fun basePageWidth(): Float {
-        return (width - sidePadding * 2).coerceAtLeast(1f)
-    }
+    private fun basePageWidth(): Float =
+        (width - sidePadding * 2).coerceAtLeast(1f)
 
-    private fun pageHeight(
-        index: Int,
-        pageWidth: Float
-    ): Float {
-
+    private fun pageHeight(index: Int, pageWidth: Float): Float {
         val size = pageSizes[index]
-
         return pageWidth * size.second / size.first
     }
 
     private fun totalDocumentHeight(): Float {
-
         if (pageSizes.isEmpty()) return 0f
-
         val pageWidth = basePageWidth() * zoom
-
         var total = pageGap * zoom
-
         for (i in pageSizes.indices) {
             total += pageHeight(i, pageWidth)
             total += pageGap * zoom
         }
-
         return total
     }
 
-    private fun maxScroll(): Int {
-        return max(
-            0f,
-            totalDocumentHeight() - height
-        ).toInt()
-    }
+    private fun maxScroll(): Int =
+        max(0f, totalDocumentHeight() - height).toInt()
 
     private fun clampScroll() {
-        scrollOffset = scrollOffset.coerceIn(
-            0f,
-            maxScroll().toFloat()
-        )
+        scrollOffset = scrollOffset.coerceIn(0f, maxScroll().toFloat())
     }
 
-    // ==================================================
-    // RENDER BACKGROUND
-    // ==================================================
+    private fun zoomBucket(z: Float): Int {
+        return (z / ZOOM_BUCKET_STEP).toInt()
+    }
+
+    private fun cacheKey(pageIndex: Int, bucket: Int): Long {
+        return (bucket.toLong() shl 32) or (pageIndex.toLong() and 0xffffffffL)
+    }
+
+    /**
+     * Zoom di sekitar titik fokus (focal point) di layar.
+     * `focusY` adalah koordinat Y di view (bukan dokumen).
+     */
+    private fun applyFocalZoom(
+        targetZoom: Float,
+        focusX: Float,
+        focusY: Float,
+        _startZoom: Float,
+        _startScroll: Float
+    ) {
+        val clamped = targetZoom.coerceIn(MIN_ZOOM, MAX_ZOOM)
+        if (clamped == zoom) return
+
+        // Posisi Y dokumen di bawah jari sebelum zoom
+        val docY = (scrollOffset + focusY) / zoom
+
+        zoom = clamped
+
+        // Sesuaikan scroll agar titik dokumen yang sama tetap di bawah jari
+        val newScroll = docY * zoom - focusY
+        scrollOffset = newScroll
+
+        clampScroll()
+    }
+
+    // ============================================================
+    // Render background
+    // ============================================================
 
     private fun requestRender(index: Int) {
-
         if (isReleased) return
         if (index !in pageSizes.indices) return
-        if (bitmapCache.get(index) != null) return
+
+        val bucket = zoomBucket(zoom)
+        val key = cacheKey(index, bucket)
+        if (bitmapCache.get(key) != null) return
+        if (!pendingRenders.add(key)) return
 
         val version = generation
-
-        val renderKey =
-            (version shl 32) or
-                (index.toLong() and 0xffffffffL)
-
-        if (!pendingRenders.add(renderKey)) return
-
-        val targetBaseWidth = basePageWidth()
+        val snapshotZoom = bucket * ZOOM_BUCKET_STEP
+        val snapshotBaseWidth = basePageWidth()
 
         try {
-
             renderExecutor.execute {
-
                 var result: Bitmap? = null
-
                 try {
-
                     synchronized(rendererLock) {
+                        if (isReleased || generation != version) return@synchronized
 
-                        if (
-                            isReleased ||
-                            generation != version
-                        ) {
-                            return@synchronized
-                        }
-
-                        val activeRenderer = pdf
-                            ?: return@synchronized
-
+                        val activeRenderer = pdf ?: return@synchronized
                         val page = activeRenderer.openPage(index)
-
                         try {
+                            if (page.width <= 0 || page.height <= 0) return@synchronized
 
-                            // Render dibuat lebih besar dari lebar layar
-                            // agar hasil tetap tajam saat diperbesar.
-                            val targetWidth = min(
-                                MAX_WIDTH,
-                                (targetBaseWidth * 2f)
-                                    .toInt()
-                                    .coerceIn(MIN_WIDTH, MAX_WIDTH)
-                            )
+                            val desiredWidth =
+                                (snapshotBaseWidth * snapshotZoom * RENDER_SCALE_EXTRA).toInt()
+                            val targetWidth = desiredWidth
+                                .coerceIn(MIN_BITMAP_WIDTH, MAX_BITMAP_WIDTH)
 
-                            val ratio =
-                                page.height.toFloat() /
-                                    page.width.toFloat()
+                            val ratio = page.height.toFloat() / page.width.toFloat()
+                            if (!ratio.isFinite() || ratio <= 0f) return@synchronized
 
-                            if (ratio <= 0f || !ratio.isFinite()) {
-                                return@synchronized
-                            }
+                            val targetHeight = (targetWidth * ratio)
+                                .toInt()
+                                .coerceAtLeast(1)
 
-                            val targetHeight =
-                                (targetWidth * ratio)
-                                    .toInt()
-                                    .coerceAtLeast(1)
-
-                            val bitmap = Bitmap.createBitmap(
+                            val bmp = Bitmap.createBitmap(
                                 targetWidth,
                                 targetHeight,
                                 Bitmap.Config.ARGB_8888
                             )
+                            bmp.eraseColor(Color.WHITE)
 
-                            bitmap.eraseColor(Color.WHITE)
-
+                            // destClip eksplisit — lebih kompatibel di banyak device
+                            val destRect = Rect(0, 0, targetWidth, targetHeight)
                             page.render(
-                                bitmap,
-                                null,
+                                bmp,
+                                destRect,
                                 null,
                                 PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY
                             )
 
-                            result = bitmap
-
+                            result = bmp
                         } finally {
-                            page.close()
+                            try { page.close() } catch (_: Exception) {}
                         }
                     }
+                } catch (ise: IllegalStateException) {
+                    Log.w(TAG, "Renderer closed saat render halaman $index", ise)
+                } catch (t: Throwable) {
+                    Log.e(TAG, "Gagal render halaman $index", t)
+                } finally {
+                    val finalBitmap = result
+                    mainHandler.post {
+                        pendingRenders.remove(key)
 
-                } catch (e: Exception) {
+                        if (isReleased || generation != version) {
+                            finalBitmap?.recycle()
+                            return@post
+                        }
 
-                    Log.e(
-                        TAG,
-                        "Render halaman $index gagal",
-                        e
-                    )
-                }
-
-                val finalBitmap = result
-
-                mainHandler.post {
-
-                    pendingRenders.remove(renderKey)
-
-                    if (
-                        isReleased ||
-                        generation != version
-                    ) {
-                        finalBitmap?.recycle()
-                        return@post
-                    }
-
-                    if (
-                        finalBitmap != null &&
-                        !finalBitmap.isRecycled
-                    ) {
-                        bitmapCache.put(index, finalBitmap)
-                        invalidate()
+                        // Simpan hanya jika bucket masih relevan
+                        if (finalBitmap != null &&
+                            !finalBitmap.isRecycled &&
+                            zoomBucket(zoom) == bucket
+                        ) {
+                            bitmapCache.put(key, finalBitmap)
+                            invalidate()
+                        } else {
+                            finalBitmap?.recycle()
+                        }
                     }
                 }
             }
-
-        } catch (e: Exception) {
-
-            pendingRenders.remove(renderKey)
-
-            Log.e(TAG, "Antrean render gagal", e)
+        } catch (re: RejectedExecutionException) {
+            pendingRenders.remove(key)
         }
     }
 
-    // ==================================================
-    // GAMBAR HALAMAN
-    // ==================================================
+    // ============================================================
+    // Drawing
+    // ============================================================
 
     override fun onDraw(canvas: Canvas) {
-
         super.onDraw(canvas)
-
         canvas.drawColor(Color.rgb(35, 42, 55))
 
         if (pageSizes.isEmpty()) return
 
         val scaledWidth = basePageWidth() * zoom
         val left = (width - scaledWidth) / 2f
-
         var top = pageGap * zoom - scrollOffset
+
+        val bucket = zoomBucket(zoom)
 
         var firstVisible = -1
         var lastVisible = -1
 
         for (i in pageSizes.indices) {
-
             val scaledHeight = pageHeight(i, scaledWidth)
             val bottom = top + scaledHeight
 
             if (bottom >= 0f && top <= height.toFloat()) {
-
-                if (firstVisible == -1) {
-                    firstVisible = i
-                }
-
+                if (firstVisible == -1) firstVisible = i
                 lastVisible = i
 
-                val rect = RectF(
-                    left,
-                    top,
-                    left + scaledWidth,
-                    bottom
-                )
+                val rect = RectF(left, top, left + scaledWidth, bottom)
 
-                // Selalu gambar bidang putih yang stabil.
+                // Latar halaman selalu stabil (tidak "kedip putih")
                 canvas.drawRect(rect, placeholderPaint)
 
-                val bitmap = bitmapCache.get(i)
+                val key = cacheKey(i, bucket)
+                val bitmap = bitmapCache.get(key)
 
-                if (
-                    bitmap != null &&
-                    !bitmap.isRecycled
-                ) {
-                    canvas.drawBitmap(
-                        bitmap,
-                        null,
-                        rect,
-                        pagePaint
-                    )
+                if (bitmap != null && !bitmap.isRecycled) {
+                    canvas.drawBitmap(bitmap, null, rect, pagePaint)
                 }
             }
 
             top = bottom + pageGap * zoom
         }
 
-        // Prioritaskan halaman yang terlihat.
+        // Prioritaskan halaman yang terlihat + 1 sebelum/sesudahnya
         if (firstVisible >= 0) {
-
-            for (i in firstVisible..lastVisible) {
-                requestRender(i)
-            }
-
-            // Siapkan halaman sebelum dan sesudahnya.
-            requestRender(firstVisible - 1)
-            requestRender(lastVisible + 1)
+            for (i in firstVisible..lastVisible) requestRender(i)
+            if (firstVisible > 0) requestRender(firstVisible - 1)
+            if (lastVisible < pageSizes.size - 1) requestRender(lastVisible + 1)
         }
     }
 
-    // ==================================================
-    // SCROLL ANIMATION
-    // ==================================================
+    // ============================================================
+    // Scroll animation
+    // ============================================================
 
     override fun computeScroll() {
-
         if (scroller.computeScrollOffset()) {
-
             scrollOffset = scroller.currY.toFloat()
-
             clampScroll()
-
             postInvalidateOnAnimation()
         }
     }
 
-    // ==================================================
-    // SENTUHAN, SCROLL DAN PINCH ZOOM
-    // ==================================================
+    // ============================================================
+    // Touch: scroll + pinch zoom
+    // ============================================================
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
-
         if (isReleased) return false
 
         scaleDetector.onTouchEvent(event)
 
         when (event.actionMasked) {
-
             MotionEvent.ACTION_DOWN -> {
-
                 scroller.abortAnimation()
-
                 velocityTracker?.recycle()
-                velocityTracker = VelocityTracker.obtain()
-
-                velocityTracker?.addMovement(event)
-
+                velocityTracker = VelocityTracker.obtain().apply { addMovement(event) }
                 lastY = event.y
-
                 parent?.requestDisallowInterceptTouchEvent(true)
-
                 return true
             }
 
@@ -489,93 +477,56 @@ class PdfDocumentView(context: Context) : View(context) {
             }
 
             MotionEvent.ACTION_MOVE -> {
-
                 velocityTracker?.addMovement(event)
 
-                if (
-                    !isScaling &&
-                    !scaleDetector.isInProgress &&
-                    event.pointerCount == 1
-                ) {
-
+                if (!isScaling && !scaleDetector.isInProgress && event.pointerCount == 1) {
                     val deltaY = event.y - lastY
-
                     scrollOffset -= deltaY
-
                     clampScroll()
-
                     postInvalidateOnAnimation()
                 }
-
                 lastY = event.y
-
                 return true
             }
 
             MotionEvent.ACTION_POINTER_UP -> {
-
-                lastY = event.getY(
-                    if (event.actionIndex == 0) 1 else 0
-                )
-
+                lastY = event.getY(if (event.actionIndex == 0) 1 else 0)
                 return true
             }
 
             MotionEvent.ACTION_UP -> {
-
                 velocityTracker?.addMovement(event)
                 velocityTracker?.computeCurrentVelocity(1000)
 
-                if (
-                    !isScaling &&
-                    !scaleDetector.isInProgress
-                ) {
-
-                    val velocityY =
-                        -(velocityTracker?.yVelocity ?: 0f)
-
-                    if (kotlin.math.abs(velocityY) > 100f) {
-
+                if (!isScaling && !scaleDetector.isInProgress) {
+                    val velocityY = -(velocityTracker?.yVelocity ?: 0f)
+                    if (abs(velocityY) > 100f) {
                         scroller.fling(
-                            0,
-                            scrollOffset.toInt(),
-                            0,
-                            velocityY.toInt(),
-                            0,
-                            0,
-                            0,
-                            maxScroll()
+                            0, scrollOffset.toInt(),
+                            0, velocityY.toInt(),
+                            0, 0,
+                            0, maxScroll()
                         )
-
                         postInvalidateOnAnimation()
                     }
                 }
 
                 velocityTracker?.recycle()
                 velocityTracker = null
-
                 isScaling = false
-
                 parent?.requestDisallowInterceptTouchEvent(false)
-
                 performClick()
-
                 return true
             }
 
             MotionEvent.ACTION_CANCEL -> {
-
                 velocityTracker?.recycle()
                 velocityTracker = null
-
                 isScaling = false
-
                 parent?.requestDisallowInterceptTouchEvent(false)
-
                 return true
             }
         }
-
         return true
     }
 
@@ -584,33 +535,30 @@ class PdfDocumentView(context: Context) : View(context) {
         return true
     }
 
-    // ==================================================
-    // RELEASE
-    // ==================================================
+    // ============================================================
+    // Release
+    // ============================================================
 
     fun release() {
-
         if (isReleased) return
 
         synchronized(rendererLock) {
-
             isReleased = true
             generation++
 
             pdf = null
             pageSizes.clear()
             pendingRenders.clear()
-
             bitmapCache.evictAll()
         }
 
-        scroller.abortAnimation()
+        mainHandler.removeCallbacks(zoomDebounceTask)
+        mainHandler.removeCallbacksAndMessages(null)
 
+        scroller.abortAnimation()
         velocityTracker?.recycle()
         velocityTracker = null
 
         renderExecutor.shutdownNow()
-
-        mainHandler.removeCallbacksAndMessages(null)
     }
 }
