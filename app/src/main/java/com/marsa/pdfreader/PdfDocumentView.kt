@@ -70,20 +70,17 @@ class PdfDocumentView(context: Context) : View(context) {
     private val renderExecutor = Executors.newFixedThreadPool(2)
 
     @Volatile
-    private var invalidateScheduled = false
+    private var redrawPending = false
 
-    private fun scheduleInvalidate() {
+    private fun requestRedraw() {
         if (isReleased) return
-        if (invalidateScheduled) return
-
-        invalidateScheduled = true
+        if (redrawPending) return
+        redrawPending = true
         mainHandler.post {
-            if (isReleased) {
-                invalidateScheduled = false
-                return@post
+            redrawPending = false
+            if (!isReleased && !isScaling) {
+                invalidate()
             }
-            invalidateScheduled = false
-            postInvalidateOnAnimation()
         }
     }
 
@@ -99,7 +96,7 @@ class PdfDocumentView(context: Context) : View(context) {
     private val zoomDebounceTask = Runnable {
         if (isReleased) return@Runnable
         evictStaleZoomCache()
-        scheduleInvalidate()
+        requestRedraw()
     }
 
     private val scroller = OverScroller(context)
@@ -138,7 +135,7 @@ class PdfDocumentView(context: Context) : View(context) {
                 if (abs(targetZoom - zoom) < 0.01f) return true
 
                 applyFocalZoom(targetZoom, pinchFocusX, pinchFocusY, pinchStartZoom, pinchStartScroll)
-                postInvalidateOnAnimation()
+                requestRedraw()
                 return true
             }
 
@@ -191,7 +188,6 @@ class PdfDocumentView(context: Context) : View(context) {
 
         synchronized(rendererLock) {
             generation++
-
             pdf = null
             pendingRenders.clear()
             bitmapCache.evictAll()
@@ -222,7 +218,7 @@ class PdfDocumentView(context: Context) : View(context) {
             }
         }
 
-        scheduleInvalidate()
+        requestRedraw()
     }
 
     fun fitToScreen() {
@@ -232,7 +228,7 @@ class PdfDocumentView(context: Context) : View(context) {
         scroller.abortAnimation()
         mainHandler.removeCallbacks(zoomDebounceTask)
         evictStaleZoomCache()
-        scheduleInvalidate()
+        requestRedraw()
     }
 
     private fun basePageWidth(): Float =
@@ -368,12 +364,11 @@ class PdfDocumentView(context: Context) : View(context) {
                             return@post
                         }
 
-                        if (finalBitmap != null &&
-                            !finalBitmap.isRecycled &&
-                            zoomBucket(zoom) == bucket
-                        ) {
+                        if (finalBitmap != null && !finalBitmap.isRecycled && zoomBucket(zoom) == bucket) {
                             bitmapCache.put(key, finalBitmap)
-                            postInvalidateOnAnimation()
+                            if (!isScaling) {
+                                requestRedraw()
+                            }
                         } else {
                             finalBitmap?.recycle()
                         }
@@ -409,13 +404,13 @@ class PdfDocumentView(context: Context) : View(context) {
                 lastVisible = i
 
                 val rect = RectF(left, top, left + scaledWidth, bottom)
-                canvas.drawRect(rect, placeholderPaint)
-
                 val key = cacheKey(i, bucket)
                 val bitmap = bitmapCache.get(key)
 
                 if (bitmap != null && !bitmap.isRecycled) {
                     canvas.drawBitmap(bitmap, null, rect, pagePaint)
+                } else {
+                    canvas.drawRect(rect, placeholderPaint)
                 }
             }
 
