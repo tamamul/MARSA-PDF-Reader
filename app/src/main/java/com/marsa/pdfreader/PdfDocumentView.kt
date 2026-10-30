@@ -31,7 +31,7 @@ class PdfDocumentView(context: Context) : View(context) {
 
         private const val MAX_BITMAP_WIDTH = 2400
         private const val MIN_BITMAP_WIDTH = 320
-        private const val RENDER_SCALE_EXTRA = 1.35f
+        private const val RENDER_SCALE_EXTRA = 1.2f
         private const val ZOOM_BUCKET_STEP = 0.25f
         private const val MIN_ZOOM = 1f
         private const val MAX_ZOOM = 4f
@@ -178,6 +178,14 @@ class PdfDocumentView(context: Context) : View(context) {
     private fun dp(value: Int): Int =
         (value * resources.displayMetrics.density).toInt()
 
+    private fun bitmapMaxWidthForCurrentZoom(): Int {
+        return when {
+            zoom >= 3.0f -> 1600
+            zoom >= 2.0f -> 1800
+            else -> MAX_BITMAP_WIDTH
+        }
+    }
+
     fun setRenderer(newRenderer: PdfRenderer?) {
         if (isReleased) return
 
@@ -313,10 +321,11 @@ class PdfDocumentView(context: Context) : View(context) {
                         try {
                             if (page.width <= 0 || page.height <= 0) return@synchronized
 
+                            val targetMaxWidth = bitmapMaxWidthForCurrentZoom()
                             val desiredWidth =
                                 (snapshotBaseWidth * snapshotZoom * RENDER_SCALE_EXTRA).toInt()
                             val targetWidth = desiredWidth
-                                .coerceIn(MIN_BITMAP_WIDTH, MAX_BITMAP_WIDTH)
+                                .coerceIn(MIN_BITMAP_WIDTH, targetMaxWidth)
 
                             val ratio = page.height.toFloat() / page.width.toFloat()
                             if (!ratio.isFinite() || ratio <= 0f) return@synchronized
@@ -457,7 +466,7 @@ class PdfDocumentView(context: Context) : View(context) {
                     val deltaX = event.x - lastX
                     val deltaY = event.y - lastY
 
-                    if (abs(deltaX) > abs(deltaY)) {
+                    if (abs(deltaX) > abs(deltaY) && zoom > 1.1f) {
                         scrollXOffset += deltaX
                         clampScroll()
                     } else {
@@ -497,7 +506,7 @@ class PdfDocumentView(context: Context) : View(context) {
                         postInvalidateOnAnimation()
                     }
 
-                    if (abs(velocityX) > 120f) {
+                    if (abs(velocityX) > 120f && zoom > 1.1f) {
                         val maxX = maxScrollX().toFloat()
                         if (maxX > 0f) {
                             scrollXOffset += velocityX / 12f
