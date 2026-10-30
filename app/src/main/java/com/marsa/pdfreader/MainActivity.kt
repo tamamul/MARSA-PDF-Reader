@@ -54,7 +54,9 @@ class MainActivity : Activity() {
         window.navigationBarColor = backgroundColor
 
         buildInterface()
+        handleIncomingPdf(intent)
     }
+
 
     private fun buildInterface() {
         val root = LinearLayout(this).apply {
@@ -518,6 +520,36 @@ class MainActivity : Activity() {
         closePdf()
         super.onDestroy()
     }
+    
+    private fun handleIncomingPdf(intent: Intent?) {
+    if (intent == null) return
+
+    val uri = when (intent.action) {
+        Intent.ACTION_VIEW -> intent.data
+        Intent.ACTION_SEND -> {
+            if (android.os.Build.VERSION.SDK_INT >= 33) {
+                intent.getParcelableExtra(
+                    Intent.EXTRA_STREAM,
+                    Uri::class.java
+                )
+            } else {
+                @Suppress("DEPRECATION")
+                intent.getParcelableExtra(Intent.EXTRA_STREAM)
+            }
+        }
+        else -> null
+    }
+
+    if (uri != null) {
+        openPdf(uri)
+    }
+}
+
+override fun onNewIntent(intent: Intent) {
+    super.onNewIntent(intent)
+    setIntent(intent)
+    handleIncomingPdf(intent)
+}
 
     private inner class PdfPageView(
         context: android.content.Context
