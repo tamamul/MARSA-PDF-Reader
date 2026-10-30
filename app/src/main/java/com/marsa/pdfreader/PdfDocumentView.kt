@@ -103,15 +103,22 @@ class PdfDocumentView(context: Context) : View(context) {
                 return@post
             }
             invalidateScheduled = false
-            invalidate()
+            postInvalidateOnAnimation()
         }
+    }
+
+    private fun evictStaleZoomCache() {
+        val currentBucket = zoomBucket(zoom)
+        val staleKeys = bitmapCache.snapshot().keys.filter { key ->
+            val bucket = (key ushr 32).toInt()
+            bucket != currentBucket
+        }
+        staleKeys.forEach { bitmapCache.remove(it) }
     }
 
     private val zoomDebounceTask = Runnable {
         if (isReleased) return@Runnable
-        // Buang bitmap bucket lama untuk halaman yang pernah di-render,
-        // supaya dirender ulang di zoom baru.
-        // (Kunci lama tidak akan pernah dipakai lagi karena bucket berbeda.)
+        evictStaleZoomCache()
         scheduleInvalidate()
     }
 
@@ -127,7 +134,6 @@ class PdfDocumentView(context: Context) : View(context) {
     }
 
     private val placeholderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        // Abu sangat terang, bukan putih — mengurangi efek "kedip putih"
         color = Color.rgb(245, 245, 245)
     }
 
@@ -151,11 +157,10 @@ class PdfDocumentView(context: Context) : View(context) {
             override fun onScale(detector: ScaleGestureDetector): Boolean {
                 val targetZoom = (zoom * detector.scaleFactor)
                     .coerceIn(MIN_ZOOM, MAX_ZOOM)
+                if (abs(targetZoom - zoom) < 0.01f) return true
 
-                // Zoom di sekitar titik fokus (focal point)
                 applyFocalZoom(targetZoom, pinchFocusX, pinchFocusY, pinchStartZoom, pinchStartScroll)
-
-                scheduleInvalidate()
+                postInvalidateOnAnimation()
                 return true
             }
 
@@ -190,8 +195,6 @@ class PdfDocumentView(context: Context) : View(context) {
         }
 
         isFocusable = true
-        // LAYER_TYPE_SOFTWARE SENGAJA TIDAK DIPAKAI:
-        // drawBitmap di hardware canvas jauh lebih halus untuk teks.
     }
 
     private fun dp(value: Int): Int =
@@ -245,6 +248,7 @@ class PdfDocumentView(context: Context) : View(context) {
         scrollOffset = 0f
         scroller.abortAnimation()
         mainHandler.removeCallbacks(zoomDebounceTask)
+        evictStaleZoomCache()
         scheduleInvalidate()
     }
 
@@ -286,10 +290,6 @@ class PdfDocumentView(context: Context) : View(context) {
         return (bucket.toLong() shl 32) or (pageIndex.toLong() and 0xffffffffL)
     }
 
-    /**
-     * Zoom di sekitar titik fokus (focal point) di layar.
-     * `focusY` adalah koordinat Y di view (bukan dokumen).
-     */
     private fun applyFocalZoom(
         targetZoom: Float,
         focusX: Float,
@@ -300,12 +300,8 @@ class PdfDocumentView(context: Context) : View(context) {
         val clamped = targetZoom.coerceIn(MIN_ZOOM, MAX_ZOOM)
         if (clamped == zoom) return
 
-        // Posisi Y dokumen di bawah jari sebelum zoom
         val docY = (scrollOffset + focusY) / zoom
-
         zoom = clamped
-
-        // Sesuaikan scroll agar titik dokumen yang sama tetap di bawah jari
         val newScroll = docY * zoom - focusY
         scrollOffset = newScroll
 
@@ -317,7 +313,7 @@ class PdfDocumentView(context: Context) : View(context) {
     // ============================================================
 
     private fun requestRender(index: Int) {
-        if (isReleased) return
+        if (isReleased || isScaling) return
         if (index !in pageSizes.indices) return
 
         val bucket = zoomBucket(zoom)
@@ -360,7 +356,6 @@ class PdfDocumentView(context: Context) : View(context) {
                             )
                             bmp.eraseColor(Color.WHITE)
 
-                            // destClip eksplisit — lebih kompatibel di banyak device
                             val destRect = Rect(0, 0, targetWidth, targetHeight)
                             page.render(
                                 bmp,
@@ -388,13 +383,12 @@ class PdfDocumentView(context: Context) : View(context) {
                             return@post
                         }
 
-                        // Simpan hanya jika bucket masih relevan
                         if (finalBitmap != null &&
                             !finalBitmap.isRecycled &&
                             zoomBucket(zoom) == bucket
                         ) {
                             bitmapCache.put(key, finalBitmap)
-                            scheduleInvalidate()
+                            postInvalidateOnAnimation()
                         } else {
                             finalBitmap?.recycle()
                         }
@@ -434,8 +428,6 @@ class PdfDocumentView(context: Context) : View(context) {
                 lastVisible = i
 
                 val rect = RectF(left, top, left + scaledWidth, bottom)
-
-                // Latar halaman selalu stabil (tidak "kedip putih")
                 canvas.drawRect(rect, placeholderPaint)
 
                 val key = cacheKey(i, bucket)
@@ -449,8 +441,7 @@ class PdfDocumentView(context: Context) : View(context) {
             top = bottom + pageGap * zoom
         }
 
-        // Prioritaskan halaman yang terlihat + 1 sebelum/sesudahnya
-        if (firstVisible >= 0) {
+        if (!isScaling && firstVisible >= 0) {
             for (i in firstVisible..lastVisible) requestRender(i)
             if (firstVisible > 0) requestRender(firstVisible - 1)
             if (lastVisible < pageSizes.size - 1) requestRender(lastVisible + 1)
