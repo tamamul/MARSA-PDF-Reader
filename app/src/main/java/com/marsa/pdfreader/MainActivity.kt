@@ -36,7 +36,7 @@ class MainActivity : Activity() {
     private val bg = Color.rgb(14, 19, 30)
     private val surface = Color.rgb(27, 35, 50)
     private val accent = Color.rgb(67, 133, 255)
-    private val foreground = Color.rgb(242, 245, 252)
+    private val textColor = Color.rgb(242, 245, 252)
 
     companion object {
         private const val PICK_PDF = 1001
@@ -102,7 +102,7 @@ class MainActivity : Activity() {
             text = "MARSA PDF Reader"
             textSize = 14f
             gravity = Gravity.CENTER
-            setTextColor(foreground)
+            setTextColor(textColor)
             maxLines = 1
             ellipsize = TextUtils.TruncateAt.MIDDLE
             typeface = Typeface.DEFAULT_BOLD
@@ -119,7 +119,7 @@ class MainActivity : Activity() {
             text = "☰"
             textSize = 27f
             gravity = Gravity.CENTER
-            setTextColor(foreground)
+            setTextColor(textColor)
             setOnClickListener { showMenu(it) }
         }
         header.addView(menuButton, LinearLayout.LayoutParams(dp(42), dp(48)))
