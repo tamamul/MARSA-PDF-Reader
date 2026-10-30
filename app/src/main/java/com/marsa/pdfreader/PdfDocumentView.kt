@@ -89,12 +89,30 @@ class PdfDocumentView(context: Context) : View(context) {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val renderExecutor = Executors.newFixedThreadPool(2)
 
+    @Volatile
+    private var invalidateScheduled = false
+
+    private fun scheduleInvalidate() {
+        if (isReleased) return
+        if (invalidateScheduled) return
+
+        invalidateScheduled = true
+        mainHandler.post {
+            if (isReleased) {
+                invalidateScheduled = false
+                return@post
+            }
+            invalidateScheduled = false
+            invalidate()
+        }
+    }
+
     private val zoomDebounceTask = Runnable {
         if (isReleased) return@Runnable
         // Buang bitmap bucket lama untuk halaman yang pernah di-render,
         // supaya dirender ulang di zoom baru.
         // (Kunci lama tidak akan pernah dipakai lagi karena bucket berbeda.)
-        invalidate()
+        scheduleInvalidate()
     }
 
     private val scroller = OverScroller(context)
@@ -137,7 +155,7 @@ class PdfDocumentView(context: Context) : View(context) {
                 // Zoom di sekitar titik fokus (focal point)
                 applyFocalZoom(targetZoom, pinchFocusX, pinchFocusY, pinchStartZoom, pinchStartScroll)
 
-                invalidate()
+                scheduleInvalidate()
                 return true
             }
 
@@ -219,7 +237,7 @@ class PdfDocumentView(context: Context) : View(context) {
             }
         }
 
-        invalidate()
+        scheduleInvalidate()
     }
 
     fun fitToScreen() {
@@ -227,7 +245,7 @@ class PdfDocumentView(context: Context) : View(context) {
         scrollOffset = 0f
         scroller.abortAnimation()
         mainHandler.removeCallbacks(zoomDebounceTask)
-        invalidate()
+        scheduleInvalidate()
     }
 
     // ============================================================
@@ -376,7 +394,7 @@ class PdfDocumentView(context: Context) : View(context) {
                             zoomBucket(zoom) == bucket
                         ) {
                             bitmapCache.put(key, finalBitmap)
-                            invalidate()
+                            scheduleInvalidate()
                         } else {
                             finalBitmap?.recycle()
                         }
