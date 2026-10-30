@@ -14,6 +14,7 @@ import android.os.Bundle
 import android.os.ParcelFileDescriptor
 import android.provider.OpenableColumns
 import android.text.TextUtils
+import android.util.Log
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
@@ -305,20 +306,29 @@ class MainActivity : Activity() {
         return name
     }
 
+    private fun grantReadPermissionIfPossible(uri: Uri) {
+        if (uri.scheme != "content") {
+            return
+        }
+
+        try {
+            contentResolver.takePersistableUriPermission(
+                uri,
+                Intent.FLAG_GRANT_READ_URI_PERMISSION
+            )
+        } catch (e: Exception) {
+            Log.w("MainActivity", "Tidak dapat menyimpan permission URI PDF", e)
+        }
+    }
+
     private fun openPdf(uri: Uri) {
         try {
             closePdf()
 
-            // Ambil persistable permission jika memungkinkan (untuk share nanti).
-            // ACTION_VIEW / SEND tidak selalu memberi flag ini — abaikan jika gagal.
-            try {
-                contentResolver.takePersistableUriPermission(
-                    uri,
-                    Intent.FLAG_GRANT_READ_URI_PERMISSION
-                )
-            } catch (_: SecurityException) {
-                // bukan error fatal
-            }
+            // ACTION_VIEW / ACTION_SEND tidak selalu punya persistable permission.
+            // Hanya content:// URI yang bisa dipersisten; file:// dan uri non-persistable
+            // harus diabaikan agar aplikasi tidak crash.
+            grantReadPermissionIfPossible(uri)
 
             val fd = contentResolver.openFileDescriptor(uri, "r")
                 ?: throw Exception("File tidak dapat dibuka.")
