@@ -2,46 +2,47 @@ package com.marsa.pdfreader
 
 import android.app.Activity
 import android.content.Intent
+import android.database.Cursor
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
-import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.RectF
 import android.graphics.pdf.PdfRenderer
 import android.net.Uri
 import android.os.Bundle
 import android.os.ParcelFileDescriptor
+import android.provider.OpenableColumns
 import android.view.Gravity
+import android.view.MenuItem
 import android.view.MotionEvent
 import android.view.ScaleGestureDetector
 import android.view.View
+import android.view.ViewGroup
 import android.widget.Button
-import android.widget.FrameLayout
-import android.widget.HorizontalScrollView
-import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.PopupMenu
 import android.widget.TextView
 import android.widget.Toast
 import android.graphics.drawable.GradientDrawable
+import android.util.LruCache
+import kotlin.math.max
+import kotlin.math.min
 
 class MainActivity : Activity() {
 
     private var descriptor: ParcelFileDescriptor? = null
     private var renderer: PdfRenderer? = null
-    private var currentPage = 0
-    private var pageCount = 0
     private var currentUri: Uri? = null
 
-    private lateinit var pageView: PdfPageView
-    private lateinit var pageLabel: TextView
-    private lateinit var thumbnailContainer: LinearLayout
+    private lateinit var documentView: PdfDocumentView
+    private lateinit var fileNameView: TextView
     private lateinit var emptyView: TextView
 
-    private val backgroundColor = Color.rgb(13, 17, 27)
-    private val surfaceColor = Color.rgb(25, 32, 46)
-    private val accentColor = Color.rgb(65, 135, 255)
-    private val textColor = Color.rgb(240, 244, 255)
+    private val bg = Color.rgb(14, 19, 30)
+    private val surface = Color.rgb(27, 35, 50)
+    private val accent = Color.rgb(67, 133, 255)
+    private val foreground = Color.rgb(242, 245, 252)
 
     companion object {
         private const val PICK_PDF = 1001
@@ -50,183 +51,161 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        window.statusBarColor = backgroundColor
-        window.navigationBarColor = backgroundColor
+        window.statusBarColor = bg
+        window.navigationBarColor = bg
 
         buildInterface()
         handleIncomingPdf(intent)
     }
 
+    private fun dp(value: Int): Int =
+        (value * resources.displayMetrics.density).toInt()
 
     private fun buildInterface() {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(backgroundColor)
-            setPadding(dp(16), dp(12), dp(16), dp(12))
+            setBackgroundColor(bg)
         }
 
         val header = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-        }
-
-        val title = TextView(this).apply {
-            text = "MARSA PDF Reader"
-            textSize = 23f
-            setTextColor(textColor)
-            setTypeface(null, android.graphics.Typeface.BOLD)
-        }
-
-        val subtitle = TextView(this).apply {
-            text = "Lightweight • Offline • Private"
-            textSize = 12f
-            setTextColor(Color.LTGRAY)
-            setPadding(0, dp(4), 0, dp(14))
-        }
-
-        header.addView(title)
-        header.addView(subtitle)
-        root.addView(header)
-
-        val toolbar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(14), dp(8), dp(10), dp(8))
+            setBackgroundColor(bg)
         }
 
-        toolbar.addView(
-            makeButton("Buka PDF", accentColor) {
-                choosePdf()
-            },
-            LinearLayout.LayoutParams(0, dp(46), 1f).apply {
+        val logo = TextView(this).apply {
+            text = "M"
+            textSize = 21f
+            gravity = Gravity.CENTER
+            setTextColor(Color.WHITE)
+            typeface = android.graphics.Typeface.DEFAULT_BOLD
+            background = GradientDrawable().apply {
+                setColor(accent)
+                cornerRadius = dp(11).toFloat()
+            }
+        }
+
+        header.addView(
+            logo,
+            LinearLayout.LayoutParams(dp(42), dp(42))
+        )
+
+        fileNameView = TextView(this).apply {
+            text = "MARSA PDF Reader"
+            textSize = 14f
+            gravity = Gravity.CENTER
+            setTextColor(foreground)
+            maxLines = 1
+            ellipsize = android.text.TextUtils.TruncateAt.MIDDLE
+            typeface = android.graphics.Typeface.DEFAULT_BOLD
+        }
+
+        header.addView(
+            fileNameView,
+            LinearLayout.LayoutParams(0, dp(48), 1f).apply {
+                marginStart = dp(8)
                 marginEnd = dp(8)
             }
         )
 
-        toolbar.addView(
-            makeButton("Bagikan", surfaceColor) {
-                sharePdf()
-            },
-            LinearLayout.LayoutParams(0, dp(46), 1f)
-        )
-
-        root.addView(toolbar)
-
-        val viewer = FrameLayout(this).apply {
-            setBackgroundColor(Color.rgb(20, 25, 36))
+        val menuButton = TextView(this).apply {
+            text = "☰"
+            textSize = 27f
+            gravity = Gravity.CENTER
+            setTextColor(foreground)
+            setOnClickListener { showMenu(this) }
         }
 
-        pageView = PdfPageView(this)
+        header.addView(
+            menuButton,
+            LinearLayout.LayoutParams(dp(42), dp(48))
+        )
+
+        root.addView(
+            header,
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                dp(60)
+            )
+        )
+
+        val viewer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Color.rgb(35, 42, 55))
+        }
+
+        documentView = PdfDocumentView()
 
         emptyView = TextView(this).apply {
-            text = "Belum ada dokumen PDF\n\nKetuk Buka PDF untuk memilih dokumen."
+            text = "MARSA PDF Reader\n\nBuka dokumen PDF untuk mulai membaca."
             textSize = 16f
             gravity = Gravity.CENTER
             setTextColor(Color.LTGRAY)
+            setLineSpacing(dp(6).toFloat(), 1f)
         }
 
         viewer.addView(
-            pageView,
-            FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.MATCH_PARENT
+            documentView,
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                0,
+                1f
             )
         )
 
         viewer.addView(
             emptyView,
-            FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.MATCH_PARENT
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT
             )
         )
 
         root.addView(
             viewer,
             LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT,
                 0,
                 1f
-            ).apply {
-                topMargin = dp(14)
-                bottomMargin = dp(12)
-            }
-        )
-
-        val thumbnailScroll = HorizontalScrollView(this).apply {
-            isHorizontalScrollBarEnabled = false
-        }
-
-        thumbnailContainer = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-        }
-
-        thumbnailScroll.addView(thumbnailContainer)
-
-        root.addView(
-            thumbnailScroll,
-            LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                dp(100)
             )
         )
-
-        val navigation = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER
-            setPadding(0, dp(12), 0, 0)
-        }
-
-        navigation.addView(
-            makeButton("‹ Sebelumnya", surfaceColor) {
-                showPage(currentPage - 1)
-            },
-            LinearLayout.LayoutParams(0, dp(48), 1f).apply {
-                marginEnd = dp(8)
-            }
-        )
-
-        pageLabel = TextView(this).apply {
-            text = "0 / 0"
-            textSize = 14f
-            gravity = Gravity.CENTER
-            setTextColor(textColor)
-        }
-
-        navigation.addView(
-            pageLabel,
-            LinearLayout.LayoutParams(dp(65), dp(48))
-        )
-
-        navigation.addView(
-            makeButton("Berikutnya ›", surfaceColor) {
-                showPage(currentPage + 1)
-            },
-            LinearLayout.LayoutParams(0, dp(48), 1f).apply {
-                marginStart = dp(8)
-            }
-        )
-
-        root.addView(navigation)
 
         setContentView(root)
     }
 
-    private fun makeButton(
-        label: String,
-        color: Int,
-        action: () -> Unit
-    ): Button {
-        return Button(this).apply {
-            text = label
-            textSize = 12f
-            isAllCaps = false
-            setTextColor(Color.WHITE)
-            background = GradientDrawable().apply {
-                setColor(color)
-                cornerRadius = dp(12).toFloat()
-            }
-            setOnClickListener { action() }
+    private fun showMenu(anchor: View) {
+        val popup = PopupMenu(this, anchor)
+
+        popup.menu.add("Buka PDF").setOnMenuItemClickListener {
+            choosePdf()
+            true
         }
+
+        popup.menu.add("Bagikan PDF").setOnMenuItemClickListener {
+            sharePdf()
+            true
+        }
+
+        popup.menu.add("Fit to Screen").setOnMenuItemClickListener {
+            documentView.fitToScreen()
+            true
+        }
+
+        popup.menu.add("Informasi aplikasi").setOnMenuItemClickListener {
+            android.app.AlertDialog.Builder(this)
+                .setTitle("MARSA PDF Reader")
+                .setMessage(
+                    "Pembaca PDF ringan dan offline.\n\n" +
+                    "Dikembangkan untuk MARSA.\n" +
+                    "Android 8.0 ke atas."
+                )
+                .setPositiveButton("Tutup", null)
+                .show()
+            true
+        }
+
+        popup.show()
     }
 
     private fun choosePdf() {
@@ -250,18 +229,65 @@ class MainActivity : Activity() {
             resultCode == RESULT_OK &&
             data?.data != null
         ) {
-            val uri = data.data!!
+            openPdf(data.data!!)
+        }
+    }
 
-            try {
-                contentResolver.takePersistableUriPermission(
-                    uri,
-                    Intent.FLAG_GRANT_READ_URI_PERMISSION
-                )
-            } catch (_: Exception) {
+    private fun handleIncomingPdf(source: Intent?) {
+        if (source == null) return
+
+        val uri = when (source.action) {
+            Intent.ACTION_VIEW -> source.data
+
+            Intent.ACTION_SEND -> {
+                if (android.os.Build.VERSION.SDK_INT >= 33) {
+                    source.getParcelableExtra(
+                        Intent.EXTRA_STREAM,
+                        Uri::class.java
+                    )
+                } else {
+                    @Suppress("DEPRECATION")
+                    source.getParcelableExtra(Intent.EXTRA_STREAM)
+                }
             }
 
+            else -> null
+        }
+
+        if (uri != null) {
             openPdf(uri)
         }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleIncomingPdf(intent)
+    }
+
+    private fun getDisplayName(uri: Uri): String {
+        var name = "Dokumen PDF"
+
+        val cursor: Cursor? = contentResolver.query(
+            uri,
+            arrayOf(OpenableColumns.DISPLAY_NAME),
+            null,
+            null,
+            null
+        )
+
+        cursor?.use {
+            if (it.moveToFirst()) {
+                val index = it.getColumnIndex(
+                    OpenableColumns.DISPLAY_NAME
+                )
+                if (index >= 0) {
+                    name = it.getString(index) ?: name
+                }
+            }
+        }
+
+        return name
     }
 
     private fun openPdf(uri: Uri) {
@@ -269,18 +295,17 @@ class MainActivity : Activity() {
             closePdf()
 
             val fd = contentResolver.openFileDescriptor(uri, "r")
-                ?: throw Exception("Tidak dapat membuka file.")
+                ?: throw Exception("File tidak dapat dibuka.")
+
+            val pdf = PdfRenderer(fd)
 
             descriptor = fd
-            renderer = PdfRenderer(fd)
+            renderer = pdf
             currentUri = uri
-            pageCount = renderer!!.pageCount
-            currentPage = 0
 
+            documentView.setRenderer(pdf)
             emptyView.visibility = View.GONE
-
-            showPage(0)
-            buildThumbnails()
+            fileNameView.text = getDisplayName(uri)
 
             Toast.makeText(
                 this,
@@ -299,212 +324,50 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun renderPage(index: Int): Bitmap {
-        val pdf = renderer ?: throw Exception("PDF belum dibuka.")
-
-        val page = pdf.openPage(index)
-
-        try {
-            val maxDimension = maxOf(page.width, page.height)
-            val scale = minOf(2f, 1600f / maxDimension)
-
-            val width = (page.width * scale).toInt().coerceAtLeast(1)
-            val height = (page.height * scale).toInt().coerceAtLeast(1)
-
-            val bitmap = Bitmap.createBitmap(
-                width,
-                height,
-                Bitmap.Config.ARGB_8888
-            )
-
-            bitmap.eraseColor(Color.WHITE)
-
-            page.render(
-                bitmap,
-                null,
-                null,
-                PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY
-            )
-
-            return bitmap
-        } finally {
-            page.close()
-        }
-    }
-
-    private fun showPage(index: Int) {
-        if (renderer == null) return
-        if (index !in 0 until pageCount) return
-
-        try {
-            currentPage = index
-
-            val bitmap = renderPage(index)
-            pageView.setBitmap(bitmap)
-
-            pageLabel.text = "${index + 1} / $pageCount"
-
-            highlightThumbnail(index)
-
-        } catch (e: Exception) {
-            Toast.makeText(
-                this,
-                "Gagal merender halaman: ${e.message}",
-                Toast.LENGTH_SHORT
-            ).show()
-        }
-    }
-
-    private fun buildThumbnails() {
-        thumbnailContainer.removeAllViews()
-
-        val limit = minOf(pageCount, 80)
-
-        for (i in 0 until limit) {
-            val bitmap = renderThumbnail(i)
-
-            val image = ImageView(this).apply {
-                setImageBitmap(bitmap)
-                scaleType = ImageView.ScaleType.FIT_CENTER
-                setPadding(dp(3), dp(3), dp(3), dp(3))
-                background = GradientDrawable().apply {
-                    setColor(surfaceColor)
-                    cornerRadius = dp(8).toFloat()
-                }
-
-                setOnClickListener {
-                    showPage(i)
-                }
-            }
-
-            thumbnailContainer.addView(
-                image,
-                LinearLayout.LayoutParams(dp(64), dp(88)).apply {
-                    marginEnd = dp(8)
-                }
-            )
-        }
-
-        if (pageCount > 80) {
-            Toast.makeText(
-                this,
-                "Thumbnail menampilkan 80 halaman pertama.",
-                Toast.LENGTH_SHORT
-            ).show()
-        }
-
-        highlightThumbnail(currentPage)
-    }
-
-    private fun renderThumbnail(index: Int): Bitmap {
-        val pdf = renderer!!
-        val page = pdf.openPage(index)
-
-        try {
-            val bitmap = Bitmap.createBitmap(
-                120,
-                160,
-                Bitmap.Config.ARGB_8888
-            )
-
-            bitmap.eraseColor(Color.WHITE)
-
-            val scale = minOf(
-                120f / page.width,
-                160f / page.height
-            )
-
-            val width = (page.width * scale).toInt()
-            val height = (page.height * scale).toInt()
-
-            val matrix = Matrix().apply {
-                setScale(scale, scale)
-            }
-
-            val canvas = Canvas(bitmap)
-            val left = (120 - width) / 2f
-            val top = (160 - height) / 2f
-
-            canvas.translate(left, top)
-
-            page.render(
-                bitmap,
-                null,
-                matrix,
-                PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY
-            )
-
-            return bitmap
-        } finally {
-            page.close()
-        }
-    }
-
-    private fun highlightThumbnail(index: Int) {
-        for (i in 0 until thumbnailContainer.childCount) {
-            val view = thumbnailContainer.getChildAt(i)
-
-            view.alpha = if (i == index) 1f else 0.55f
-
-            view.background = GradientDrawable().apply {
-                setColor(surfaceColor)
-                cornerRadius = dp(8).toFloat()
-                if (i == index) {
-                    setStroke(dp(2), accentColor)
-                }
-            }
-        }
-    }
-
     private fun sharePdf() {
         val uri = currentUri
 
         if (uri == null) {
             Toast.makeText(
                 this,
-                "Buka PDF terlebih dahulu.",
+                "Belum ada PDF yang dibuka.",
                 Toast.LENGTH_SHORT
             ).show()
             return
         }
 
-        val intent = Intent(Intent.ACTION_SEND).apply {
+        val send = Intent(Intent.ACTION_SEND).apply {
             type = "application/pdf"
             putExtra(Intent.EXTRA_STREAM, uri)
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
 
         startActivity(
-            Intent.createChooser(intent, "Bagikan PDF")
+            Intent.createChooser(send, "Bagikan dokumen PDF")
         )
     }
 
     private fun closePdf() {
-        pageView.setBitmap(null)
+        if (::documentView.isInitialized) {
+            documentView.setRenderer(null)
+        }
 
         try {
             renderer?.close()
         } catch (_: Exception) {
         }
 
-        renderer = null
-
         try {
             descriptor?.close()
         } catch (_: Exception) {
         }
 
+        renderer = null
         descriptor = null
         currentUri = null
-        pageCount = 0
-        currentPage = 0
 
-        if (::thumbnailContainer.isInitialized) {
-            thumbnailContainer.removeAllViews()
-        }
-
-        if (::pageLabel.isInitialized) {
-            pageLabel.text = "0 / 0"
+        if (::fileNameView.isInitialized) {
+            fileNameView.text = "MARSA PDF Reader"
         }
 
         if (::emptyView.isInitialized) {
@@ -512,100 +375,199 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun dp(value: Int): Int {
-        return (value * resources.displayMetrics.density).toInt()
-    }
-
     override fun onDestroy() {
         closePdf()
         super.onDestroy()
     }
-    
-    private fun handleIncomingPdf(intent: Intent?) {
-    if (intent == null) return
 
-    val uri = when (intent.action) {
-        Intent.ACTION_VIEW -> intent.data
-        Intent.ACTION_SEND -> {
-            if (android.os.Build.VERSION.SDK_INT >= 33) {
-                intent.getParcelableExtra(
-                    Intent.EXTRA_STREAM,
-                    Uri::class.java
-                )
-            } else {
-                @Suppress("DEPRECATION")
-                intent.getParcelableExtra(Intent.EXTRA_STREAM)
-            }
-        }
-        else -> null
-    }
+    private inner class PdfDocumentView : View(this@MainActivity) {
 
-    if (uri != null) {
-        openPdf(uri)
-    }
-}
+        private var pdf: PdfRenderer? = null
+        private val pageSizes = mutableListOf<Pair<Int, Int>>()
 
-override fun onNewIntent(intent: Intent) {
-    super.onNewIntent(intent)
-    setIntent(intent)
-    handleIncomingPdf(intent)
-}
-
-    private inner class PdfPageView(
-        context: android.content.Context
-    ) : View(context) {
-
-        private var bitmap: Bitmap? = null
-        private var scale = 1f
-        private var offsetX = 0f
-        private var offsetY = 0f
-        private var lastX = 0f
+        private var zoom = 1f
+        private var scrollOffset = 0f
         private var lastY = 0f
 
-        private val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+        private val pageGap = dp(16).toFloat()
+        private val sidePadding = dp(16).toFloat()
 
-        private val scaleDetector =
-            ScaleGestureDetector(context,
-                object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
-                    override fun onScale(
-                        detector: ScaleGestureDetector
-                    ): Boolean {
-                        scale = (scale * detector.scaleFactor)
-                            .coerceIn(1f, 5f)
-                        invalidate()
-                        return true
-                    }
+        private val bitmapCache = object : LruCache<Int, Bitmap>(6) {
+            override fun sizeOf(key: Int, value: Bitmap): Int {
+                return value.byteCount / 1024
+            }
+        }
+
+        private val pagePaint = Paint(
+            Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG
+        )
+
+        private val backgroundPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+        }
+
+        private val scaleDetector = ScaleGestureDetector(
+            this@MainActivity,
+            object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+                override fun onScale(
+                    detector: ScaleGestureDetector
+                ): Boolean {
+                    zoom = (zoom * detector.scaleFactor)
+                        .coerceIn(1f, 4f)
+                    clampScroll()
+                    invalidate()
+                    return true
                 }
-            )
+            }
+        )
 
-        fun setBitmap(newBitmap: Bitmap?) {
-            val old = bitmap
-            bitmap = newBitmap
-            scale = 1f
-            offsetX = 0f
-            offsetY = 0f
+        init {
+            setLayerType(View.LAYER_TYPE_SOFTWARE, null)
+            isFocusable = true
+        }
 
-            if (old != null && old !== newBitmap && !old.isRecycled) {
-                old.recycle()
+        fun setRenderer(newRenderer: PdfRenderer?) {
+            bitmapCache.evictAll()
+            pdf = newRenderer
+            pageSizes.clear()
+            scrollOffset = 0f
+            zoom = 1f
+
+            if (newRenderer != null) {
+                for (i in 0 until newRenderer.pageCount) {
+                    val page = newRenderer.openPage(i)
+                    pageSizes.add(
+                        Pair(page.width, page.height)
+                    )
+                    page.close()
+                }
             }
 
             invalidate()
         }
 
+        fun fitToScreen() {
+            zoom = 1f
+            scrollOffset = 0f
+            invalidate()
+        }
+
+        private fun basePageWidth(): Float {
+            return (width - sidePadding * 2).coerceAtLeast(1f)
+        }
+
+        private fun pageHeight(index: Int, pageWidth: Float): Float {
+            val size = pageSizes[index]
+            return pageWidth * size.second / size.first
+        }
+
+        private fun totalDocumentHeight(): Float {
+            if (pageSizes.isEmpty()) return 0f
+
+            val pageWidth = basePageWidth() * zoom
+            var total = pageGap * zoom
+
+            for (i in pageSizes.indices) {
+                total += pageHeight(i, pageWidth)
+                total += pageGap * zoom
+            }
+
+            return total
+        }
+
+        private fun clampScroll() {
+            val maximum = max(
+                0f,
+                totalDocumentHeight() - height
+            )
+            scrollOffset = scrollOffset.coerceIn(0f, maximum)
+        }
+
+        private fun renderPage(index: Int): Bitmap? {
+            bitmapCache.get(index)?.let { return it }
+
+            val renderer = pdf ?: return null
+
+            return try {
+                val page = renderer.openPage(index)
+
+                try {
+                    val targetWidth = min(
+                        1800,
+                        (basePageWidth() * zoom * 2f).toInt()
+                            .coerceAtLeast(1)
+                    )
+
+                    val ratio = page.height.toFloat() / page.width
+                    val targetHeight = (targetWidth * ratio)
+                        .toInt().coerceAtLeast(1)
+
+                    val bitmap = Bitmap.createBitmap(
+                        targetWidth,
+                        targetHeight,
+                        Bitmap.Config.ARGB_8888
+                    )
+
+                    bitmap.eraseColor(Color.WHITE)
+
+                    page.render(
+                        bitmap,
+                        null,
+                        null,
+                        PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY
+                    )
+
+                    bitmapCache.put(index, bitmap)
+                    bitmap
+                } finally {
+                    page.close()
+                }
+            } catch (_: Exception) {
+                null
+            }
+        }
+
         override fun onDraw(canvas: Canvas) {
             super.onDraw(canvas)
+            canvas.drawColor(Color.rgb(35, 42, 55))
 
-            val image = bitmap ?: return
+            if (pageSizes.isEmpty()) return
 
-            val matrix = Matrix()
-            val left = (width - image.width * scale) / 2f + offsetX
-            val top = (height - image.height * scale) / 2f + offsetY
+            val scaledWidth = basePageWidth() * zoom
+            val left = (width - scaledWidth) / 2f
 
-            matrix.setScale(scale, scale)
-            matrix.postTranslate(left, top)
+            var top = pageGap * zoom - scrollOffset
 
-            canvas.drawColor(Color.rgb(20, 25, 36))
-            canvas.drawBitmap(image, matrix, paint)
+            for (i in pageSizes.indices) {
+                val scaledHeight = pageHeight(i, scaledWidth)
+                val bottom = top + scaledHeight
+
+                if (bottom >= 0 && top <= height) {
+                    val rect = RectF(
+                        left,
+                        top,
+                        left + scaledWidth,
+                        bottom
+                    )
+
+                    canvas.drawRect(rect, backgroundPaint)
+
+                    val bitmap = renderPage(i)
+
+                    if (bitmap != null) {
+                        canvas.drawBitmap(
+                            bitmap,
+                            null,
+                            rect,
+                            pagePaint
+                        )
+                    }
+                }
+
+                top = bottom + pageGap * zoom
+            }
+
+            clampScroll()
         }
 
         override fun onTouchEvent(event: MotionEvent): Boolean {
@@ -613,23 +575,27 @@ override fun onNewIntent(intent: Intent) {
 
             when (event.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
-                    lastX = event.x
                     lastY = event.y
+                    return true
                 }
 
                 MotionEvent.ACTION_MOVE -> {
-                    if (!scaleDetector.isInProgress && scale > 1f) {
-                        offsetX += event.x - lastX
-                        offsetY += event.y - lastY
+                    if (!scaleDetector.isInProgress) {
+                        scrollOffset -= event.y - lastY
+                        clampScroll()
                         invalidate()
                     }
 
-                    lastX = event.x
                     lastY = event.y
+                    return true
                 }
 
-                MotionEvent.ACTION_UP,
-                MotionEvent.ACTION_CANCEL -> performClick()
+                MotionEvent.ACTION_UP -> {
+                    performClick()
+                    return true
+                }
+
+                MotionEvent.ACTION_CANCEL -> return true
             }
 
             return true
