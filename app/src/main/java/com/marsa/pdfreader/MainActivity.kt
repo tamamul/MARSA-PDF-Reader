@@ -1,4 +1,3 @@
-
 package com.marsa.pdfreader
 
 import android.content.Context
@@ -10,20 +9,28 @@ import android.graphics.RectF
 import android.graphics.pdf.PdfRenderer
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
 import android.util.LruCache
 import android.view.MotionEvent
 import android.view.ScaleGestureDetector
 import android.view.View
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 import kotlin.math.max
 import kotlin.math.min
 
 class PdfDocumentView(context: Context) : View(context) {
 
+    companion object {
+        private const val TAG = "PdfDocumentView"
+        private const val MAX_TARGET_WIDTH = 1600
+        private const val MIN_TARGET_WIDTH = 320
+    }
+
     // ---------- Renderer & page metadata ----------
     private var pdf: PdfRenderer? = null
     private val pageSizes = mutableListOf<Pair<Int, Int>>()
-    private var pageCount = 0
 
     // ---------- View state ----------
     private var zoom = 1f
@@ -34,8 +41,8 @@ class PdfDocumentView(context: Context) : View(context) {
     private val pageGap = dp(16).toFloat()
     private val sidePadding = dp(16).toFloat()
 
-    // ---------- Cache (fixed) ----------
-    // Ukuran cache dalam KB, sekitar 1/8 heap
+    // ---------- Cache ----------
+    // maxCacheKb dalam KB, sekitar 1/8 heap
     private val maxCacheKb: Int =
         (Runtime.getRuntime().maxMemory() / 1024 / 8).toInt().coerceAtLeast(1024)
 
@@ -46,8 +53,11 @@ class PdfDocumentView(context: Context) : View(context) {
     // ---------- Threading ----------
     private val renderExecutor = Executors.newFixedThreadPool(2)
     private val mainHandler = Handler(Looper.getMainLooper())
-    private val pendingRenders = HashSet<Int>()          // page index yang sedang dirender
-    @Volatile private var isRendererClosed = false
+
+    // ConcurrentHashMap.newKeySet() aman diakses multi-thread
+    private val pendingRenders: MutableSet<Int> = ConcurrentHashMap.newKeySet()
+
+    @Volatile private var isReleased = false
 
     // ---------- Paint ----------
     private val pagePaint = Paint(
@@ -95,29 +105,37 @@ class PdfDocumentView(context: Context) : View(context) {
     // ============================================================
 
     fun setRenderer(newRenderer: PdfRenderer?) {
-        // 1) Hentikan semua render yang mungkin sedang berjalan
-        isRendererClosed = true                     // tandai agar render lama berhenti
+        if (isReleased) return
+
+        // 1) Bersihkan state lama
         pendingRenders.clear()
         bitmapCache.evictAll()
 
-        // 2) Putus referensi ke renderer lama SEBELUM close
         pdf = null
-        pageCount = 0
         pageSizes.clear()
         scrollOffset = 0f
         zoom = 1f
 
-        // 3) Pasang renderer baru
+        // 2) Baca ukuran halaman. Jika ada halaman rusak, buang renderer.
         if (newRenderer != null) {
-            val count = newRenderer.pageCount
-            for (i in 0 until count) {
-                val page = newRenderer.openPage(i)
-                pageSizes.add(Pair(page.width, page.height))
-                page.close()
+            try {
+                val count = newRenderer.pageCount
+                for (i in 0 until count) {
+                    val page = newRenderer.openPage(i)
+                    try {
+                        if (page.width > 0 && page.height > 0) {
+                            pageSizes.add(Pair(page.width, page.height))
+                        }
+                    } finally {
+                        page.close()
+                    }
+                }
+                pdf = newRenderer
+            } catch (e: Exception) {
+                Log.e(TAG, "Gagal membaca page metadata", e)
+                pageSizes.clear()
+                pdf = null
             }
-            pageCount = count
-            pdf = newRenderer
-            isRendererClosed = false
         }
 
         invalidate()
@@ -161,55 +179,93 @@ class PdfDocumentView(context: Context) : View(context) {
     // ============================================================
 
     private fun requestRenderIfNeeded(index: Int) {
+        if (isReleased) return
+        if (index < 0 || index >= pageSizes.size) return
         if (bitmapCache.get(index) != null) return
-        if (pendingRenders.contains(index)) return
+        if (!pendingRenders.add(index)) return   // sudah ada di antrean
 
-        val renderer = pdf ?: return
-        pendingRenders.add(index)
+        val renderer = pdf ?: run {
+            pendingRenders.remove(index)
+            return
+        }
 
-        renderExecutor.execute {
-            var bitmap: Bitmap? = null
-            try {
-                // pastikan renderer belum ditutup
-                if (isRendererClosed) return@execute
+        // Snapshot nilai UI-thread untuk dipakai di background
+        val snapshotZoom = zoom
+        val snapshotBaseWidth = basePageWidth()
 
-                val page = renderer.openPage(index)
+        try {
+            renderExecutor.execute {
+                var result: Bitmap? = null
                 try {
-                    val targetWidth = min(
-                        1600,
-                        (basePageWidth() * zoom * 2f).toInt().coerceAtLeast(1)
-                    )
-                    val ratio = page.height.toFloat() / page.width
-                    val targetHeight = (targetWidth * ratio).toInt().coerceAtLeast(1)
+                    if (isReleased) return@execute
 
-                    bitmap = Bitmap.createBitmap(
-                        targetWidth,
-                        targetHeight,
-                        Bitmap.Config.ARGB_8888
-                    )
-                    bitmap.eraseColor(Color.WHITE)
-                    page.render(
-                        bitmap,
-                        null,
-                        null,
-                        PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY
-                    )
-                } finally {
-                    page.close()
-                }
-            } catch (_: Exception) {
-                bitmap?.recycle()
-                bitmap = null
-            }
+                    val page = renderer.openPage(index)
+                    try {
+                        // Guard: ukuran halaman valid
+                        if (page.width <= 0 || page.height <= 0) {
+                            return@execute
+                        }
 
-            val result = bitmap
-            mainHandler.post {
-                pendingRenders.remove(index)
-                if (result != null && !isRendererClosed) {
-                    bitmapCache.put(index, result)
-                    invalidate()
+                        val targetWidth = min(
+                            MAX_TARGET_WIDTH,
+                            (snapshotBaseWidth * snapshotZoom * 2f)
+                                .toInt()
+                                .coerceIn(MIN_TARGET_WIDTH, MAX_TARGET_WIDTH)
+                        )
+
+                        val ratio = page.height.toFloat() / page.width.toFloat()
+                        if (ratio.isNaN() || ratio.isInfinite() || ratio <= 0f) {
+                            return@execute
+                        }
+
+                        val targetHeight = (targetWidth * ratio)
+                            .toInt()
+                            .coerceAtLeast(1)
+
+                        // RGB_565 = 2 byte/pixel, hemat memori
+                        val bmp = Bitmap.createBitmap(
+                            targetWidth,
+                            targetHeight,
+                            Bitmap.Config.RGB_565
+                        )
+                        bmp.eraseColor(Color.WHITE)
+                        page.render(
+                            bmp,
+                            null,
+                            null,
+                            PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY
+                        )
+                        result = bmp
+                    } finally {
+                        try { page.close() } catch (_: Exception) {}
+                    }
+                } catch (ise: IllegalStateException) {
+                    // Renderer sudah ditutup di tengah render — abaikan
+                    Log.w(TAG, "Renderer closed saat render halaman $index", ise)
+                } catch (t: Throwable) {
+                    Log.e(TAG, "Gagal render halaman $index", t)
+                }
+
+                val finalBitmap = result
+                mainHandler.post {
+                    pendingRenders.remove(index)
+
+                    if (isReleased) {
+                        finalBitmap?.recycle()
+                        return@post
+                    }
+
+                    if (finalBitmap != null &&
+                        !finalBitmap.isRecycled &&
+                        index < pageSizes.size
+                    ) {
+                        bitmapCache.put(index, finalBitmap)
+                        invalidate()
+                    }
                 }
             }
+        } catch (re: RejectedExecutionException) {
+            pendingRenders.remove(index)
         }
     }
 
@@ -239,7 +295,6 @@ class PdfDocumentView(context: Context) : View(context) {
                     canvas.drawRect(rect, backgroundPaint)
                     canvas.drawBitmap(bitmap, null, rect, pagePaint)
                 } else {
-                    // placeholder sambil menunggu render
                     canvas.drawRect(rect, placeholderPaint)
                     requestRenderIfNeeded(i)
                 }
@@ -254,6 +309,8 @@ class PdfDocumentView(context: Context) : View(context) {
     // ============================================================
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
+        if (isReleased) return false
+
         scaleDetector.onTouchEvent(event)
 
         when (event.actionMasked) {
@@ -292,9 +349,14 @@ class PdfDocumentView(context: Context) : View(context) {
     // ============================================================
 
     fun release() {
-        isRendererClosed = true
+        if (isReleased) return
+        isReleased = true
+
+        pdf = null
         pendingRenders.clear()
         bitmapCache.evictAll()
+
+        mainHandler.removeCallbacksAndMessages(null)
         renderExecutor.shutdownNow()
     }
 }
