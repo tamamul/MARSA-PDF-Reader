@@ -22,7 +22,6 @@ import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
 import kotlin.math.abs
 import kotlin.math.max
-import kotlin.math.min
 
 class PdfDocumentView(context: Context) : View(context) {
 
@@ -35,7 +34,7 @@ class PdfDocumentView(context: Context) : View(context) {
         private const val ZOOM_BUCKET_STEP = 0.25f
         private const val MIN_ZOOM = 1f
         private const val MAX_ZOOM = 4f
-        private const val ZOOM_DEBOUNCE_MS = 200L
+        private const val ZOOM_DEBOUNCE_MS = 180L
         private const val MAX_PENDING_RENDERS = 6
     }
 
@@ -43,23 +42,24 @@ class PdfDocumentView(context: Context) : View(context) {
 
     @Volatile
     private var pdf: PdfRenderer? = null
+
     private val pageSizes = mutableListOf<Pair<Int, Int>>()
+
     @Volatile
     private var generation = 0L
+
     @Volatile
     private var isReleased = false
 
     private var zoom = 1f
     private var scrollOffset = 0f
     private var scrollXOffset = 0f
-    private var lastY = 0f
     private var lastX = 0f
+    private var lastY = 0f
     private var isScaling = false
 
     private var pinchFocusX = 0f
     private var pinchFocusY = 0f
-    private var pinchStartZoom = 1f
-    private var pinchStartScroll = 0f
 
     private val pageGap = dp(12).toFloat()
     private val sidePadding = dp(12).toFloat()
@@ -68,7 +68,7 @@ class PdfDocumentView(context: Context) : View(context) {
     private val pendingRenders: MutableSet<Long> = ConcurrentHashMap.newKeySet()
 
     private val mainHandler = Handler(Looper.getMainLooper())
-    private val renderExecutor = Executors.newFixedThreadPool(1)
+    private val renderExecutor = Executors.newSingleThreadExecutor()
 
     @Volatile
     private var redrawPending = false
@@ -77,6 +77,7 @@ class PdfDocumentView(context: Context) : View(context) {
         if (isReleased) return
         if (redrawPending) return
         redrawPending = true
+
         mainHandler.post {
             redrawPending = false
             if (!isReleased && !isScaling) {
@@ -120,20 +121,19 @@ class PdfDocumentView(context: Context) : View(context) {
             override fun onScaleBegin(detector: ScaleGestureDetector): Boolean {
                 isScaling = true
                 scroller.abortAnimation()
+
                 pinchFocusX = detector.focusX
                 pinchFocusY = detector.focusY
-                pinchStartZoom = zoom
-                pinchStartScroll = scrollOffset
+
                 mainHandler.removeCallbacks(zoomDebounceTask)
                 return true
             }
 
             override fun onScale(detector: ScaleGestureDetector): Boolean {
-                val targetZoom = (zoom * detector.scaleFactor)
-                    .coerceIn(MIN_ZOOM, MAX_ZOOM)
+                val targetZoom = (zoom * detector.scaleFactor).coerceIn(MIN_ZOOM, MAX_ZOOM)
                 if (abs(targetZoom - zoom) < 0.01f) return true
 
-                applyFocalZoom(targetZoom, pinchFocusX, pinchFocusY, pinchStartZoom, pinchStartScroll)
+                applyFocalZoom(targetZoom, pinchFocusX, pinchFocusY)
                 requestRedraw()
                 return true
             }
@@ -147,9 +147,7 @@ class PdfDocumentView(context: Context) : View(context) {
     )
 
     init {
-        val cacheKb = (Runtime.getRuntime().maxMemory() / 1024 / 6)
-            .toInt()
-            .coerceAtLeast(4096)
+        val cacheKb = (Runtime.getRuntime().maxMemory() / 1024 / 6).toInt().coerceAtLeast(4096)
 
         bitmapCache = object : LruCache<Long, Bitmap>(cacheKb) {
             override fun sizeOf(key: Long, value: Bitmap): Int {
@@ -176,8 +174,8 @@ class PdfDocumentView(context: Context) : View(context) {
 
     private fun bitmapMaxWidthForCurrentZoom(): Int {
         return when {
-            zoom >= 3.0f -> 1600
-            zoom >= 2.0f -> 1800
+            zoom >= 3f -> 1600
+            zoom >= 2f -> 1800
             else -> MAX_BITMAP_WIDTH
         }
     }
@@ -194,6 +192,7 @@ class PdfDocumentView(context: Context) : View(context) {
 
             scrollOffset = 0f
             scrollXOffset = 0f
+            zoom = 1f
             scroller.abortAnimation()
 
             if (newRenderer != null) {
@@ -240,6 +239,7 @@ class PdfDocumentView(context: Context) : View(context) {
 
     private fun totalDocumentHeight(): Float {
         if (pageSizes.isEmpty()) return 0f
+
         val pageWidth = basePageWidth() * zoom
         var total = pageGap * zoom
         for (i in pageSizes.indices) {
@@ -265,35 +265,29 @@ class PdfDocumentView(context: Context) : View(context) {
         }
     }
 
-    private fun zoomBucket(z: Float): Int {
-        return (z / ZOOM_BUCKET_STEP).toInt()
-    }
+    private fun zoomBucket(z: Float): Int =
+        (z / ZOOM_BUCKET_STEP).toInt()
 
-    private fun cacheKey(pageIndex: Int, bucket: Int): Long {
-        return (bucket.toLong() shl 32) or (pageIndex.toLong() and 0xffffffffL)
-    }
+    private fun cacheKey(pageIndex: Int, bucket: Int): Long =
+        (bucket.toLong() shl 32) or (pageIndex.toLong() and 0xffffffffL)
 
-    private fun applyFocalZoom(
-        targetZoom: Float,
-        focusX: Float,
-        focusY: Float,
-        _startZoom: Float,
-        _startScroll: Float
-    ) {
+    private fun applyFocalZoom(targetZoom: Float, focusX: Float, focusY: Float) {
         val clamped = targetZoom.coerceIn(MIN_ZOOM, MAX_ZOOM)
         if (clamped == zoom) return
 
         val docY = (scrollOffset + focusY) / zoom
+        val docX = (scrollXOffset + focusX) / zoom
+
         zoom = clamped
-        val newScroll = docY * zoom - focusY
-        scrollOffset = newScroll
+        scrollOffset = docY * zoom - focusY
+        scrollXOffset = docX * zoom - focusX
+
         clampScroll()
     }
 
     private fun requestRender(index: Int) {
         if (isReleased || isScaling) return
         if (index !in pageSizes.indices) return
-
         if (pendingRenders.size >= MAX_PENDING_RENDERS) return
 
         val bucket = zoomBucket(zoom)
@@ -308,6 +302,7 @@ class PdfDocumentView(context: Context) : View(context) {
         try {
             renderExecutor.execute {
                 var result: Bitmap? = null
+
                 try {
                     synchronized(rendererLock) {
                         if (isReleased || generation != version) return@synchronized
@@ -326,9 +321,7 @@ class PdfDocumentView(context: Context) : View(context) {
                             val ratio = page.height.toFloat() / page.width.toFloat()
                             if (!ratio.isFinite() || ratio <= 0f) return@synchronized
 
-                            val targetHeight = (targetWidth * ratio)
-                                .toInt()
-                                .coerceAtLeast(1)
+                            val targetHeight = (targetWidth * ratio).toInt().coerceAtLeast(1)
 
                             val bmp = Bitmap.createBitmap(
                                 targetWidth,
@@ -337,10 +330,10 @@ class PdfDocumentView(context: Context) : View(context) {
                             )
                             bmp.eraseColor(Color.WHITE)
 
-                            val destRect = Rect(0, 0, targetWidth, targetHeight)
+                            val dest = Rect(0, 0, targetWidth, targetHeight)
                             page.render(
                                 bmp,
-                                destRect,
+                                dest,
                                 null,
                                 PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY
                             )
@@ -364,12 +357,10 @@ class PdfDocumentView(context: Context) : View(context) {
                             return@post
                         }
 
-                        if (finalBitmap != null &&
-                            !finalBitmap.isRecycled &&
+                        if (finalBitmap != null && !finalBitmap.isRecycled &&
                             zoomBucket(zoom) == bucket
                         ) {
                             bitmapCache.put(key, finalBitmap)
-                            if (!isScaling) requestRedraw()
                         } else {
                             finalBitmap?.recycle()
                         }
@@ -392,6 +383,7 @@ class PdfDocumentView(context: Context) : View(context) {
         var top = pageGap * zoom - scrollOffset
 
         val bucket = zoomBucket(zoom)
+
         var firstVisible = -1
         var lastVisible = -1
 
@@ -442,8 +434,8 @@ class PdfDocumentView(context: Context) : View(context) {
                 scroller.abortAnimation()
                 velocityTracker?.recycle()
                 velocityTracker = VelocityTracker.obtain().apply { addMovement(event) }
-                lastY = event.y
                 lastX = event.x
+                lastY = event.y
                 parent?.requestDisallowInterceptTouchEvent(true)
                 return true
             }
@@ -460,7 +452,8 @@ class PdfDocumentView(context: Context) : View(context) {
                 if (!isScaling && !scaleDetector.isInProgress && event.pointerCount == 1) {
                     val deltaX = event.x - lastX
                     val deltaY = event.y - lastY
-                    val canPanX = zoom > 1.1f && maxScrollX() > 0
+
+                    val canPanX = zoom > 1.15f && maxScrollX() > 0
                     val canPanY = maxScroll() > 0
 
                     val horizontalIntent = canPanX && abs(deltaX) > abs(deltaY) * 1.2f
@@ -501,15 +494,19 @@ class PdfDocumentView(context: Context) : View(context) {
 
                     if (abs(velocityY) > 100f) {
                         scroller.fling(
-                            0, scrollOffset.toInt(),
-                            0, velocityY.toInt(),
-                            0, 0,
-                            0, maxScroll()
+                            0,
+                            scrollOffset.toInt(),
+                            0,
+                            velocityY.toInt(),
+                            0,
+                            0,
+                            0,
+                            maxScroll()
                         )
                         postInvalidateOnAnimation()
                     }
 
-                    if (zoom > 1.1f && abs(velocityX) > 120f && maxScrollX() > 0) {
+                    if (zoom > 1.15f && abs(velocityX) > 120f && maxScrollX() > 0) {
                         scrollXOffset += velocityX / 12f
                         clampScroll()
                         postInvalidateOnAnimation()
@@ -532,6 +529,7 @@ class PdfDocumentView(context: Context) : View(context) {
                 return true
             }
         }
+
         return true
     }
 
