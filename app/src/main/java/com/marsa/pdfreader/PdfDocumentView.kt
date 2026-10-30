@@ -87,13 +87,9 @@ class PdfDocumentView(context: Context) : View(context) {
     }
 
     private fun evictStaleZoomCache() {
-        val currentBucket = zoomBucket(zoom)
-        val staleKeys = bitmapCache.snapshot().keys.filter { key ->
-            val bucket = (key ushr 32).toInt()
-            bucket != currentBucket
-        }
-        staleKeys.forEach { bitmapCache.remove(it) }
-    }
+    // Jangan hapus bitmap lama saat zoom.
+    // Bitmap lama tetap dipakai sementara bitmap baru dirender.
+}
 
     private val zoomDebounceTask = Runnable {
         if (isReleased) return@Runnable
@@ -253,7 +249,10 @@ class PdfDocumentView(context: Context) : View(context) {
         max(0f, totalDocumentHeight() - height).toInt()
 
     private fun maxScrollX(): Int =
-        max(0f, (basePageWidth() * zoom) - width).toInt()
+    max(
+        0f,
+        (basePageWidth() * zoom - width) / 2f
+    ).toInt()
 
     private fun clampScroll() {
         scrollOffset = scrollOffset.coerceIn(0f, maxScroll().toFloat())
@@ -271,19 +270,37 @@ class PdfDocumentView(context: Context) : View(context) {
     private fun cacheKey(pageIndex: Int, bucket: Int): Long =
         (bucket.toLong() shl 32) or (pageIndex.toLong() and 0xffffffffL)
 
-    private fun applyFocalZoom(targetZoom: Float, focusX: Float, focusY: Float) {
-        val clamped = targetZoom.coerceIn(MIN_ZOOM, MAX_ZOOM)
-        if (clamped == zoom) return
+    private fun applyFocalZoom(
+    targetZoom: Float,
+    focusX: Float,
+    focusY: Float
+) {
+    val newZoom = targetZoom.coerceIn(MIN_ZOOM, MAX_ZOOM)
 
-        val docY = (scrollOffset + focusY) / zoom
-        val docX = (scrollXOffset + focusX) / zoom
+    if (newZoom == zoom) return
 
-        zoom = clamped
-        scrollOffset = docY * zoom - focusY
-        scrollXOffset = docX * zoom - focusX
+    val oldZoom = zoom
 
-        clampScroll()
-    }
+    val oldLeft =
+        (width - basePageWidth() * oldZoom) / 2f +
+            scrollXOffset
+
+    val documentX = (focusX - oldLeft) / oldZoom
+    val documentY = (scrollOffset + focusY) / oldZoom
+
+    zoom = newZoom
+
+    val newLeft =
+        (width - basePageWidth() * newZoom) / 2f
+
+    scrollXOffset =
+        focusX - newLeft - documentX * newZoom
+
+    scrollOffset =
+        documentY * newZoom - focusY
+
+    clampScroll()
+}
 
     private fun requestRender(index: Int) {
         if (isReleased || isScaling) return
@@ -397,13 +414,26 @@ class PdfDocumentView(context: Context) : View(context) {
 
                 val rect = RectF(left, top, left + scaledWidth, bottom)
                 val key = cacheKey(i, bucket)
-                val bitmap = bitmapCache.get(key)
 
-                if (bitmap != null && !bitmap.isRecycled) {
-                    canvas.drawBitmap(bitmap, null, rect, pagePaint)
-                } else {
-                    canvas.drawRect(rect, placeholderPaint)
-                }
+var bitmap = bitmapCache.get(key)
+
+// Jika bitmap untuk zoom baru belum tersedia,
+// gunakan bitmap lama agar teks tidak menghilang.
+if (bitmap == null || bitmap.isRecycled) {
+    val oldBitmap = bitmapCache.snapshot().entries
+        .firstOrNull { entry ->
+            (entry.key and 0xffffffffL) == i.toLong() &&
+                !entry.value.isRecycled
+        }
+
+    bitmap = oldBitmap?.value
+}
+
+if (bitmap != null && !bitmap.isRecycled) {
+    canvas.drawBitmap(bitmap, null, rect, pagePaint)
+} else {
+    canvas.drawRect(rect, placeholderPaint)
+}
             }
 
             top = bottom + pageGap * zoom
