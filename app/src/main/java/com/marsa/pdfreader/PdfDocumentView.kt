@@ -1,3 +1,4 @@
+
 package com.marsa.pdfreader
 
 import android.content.Context
@@ -5,7 +6,6 @@ import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
-import android.graphics.Rect
 import android.graphics.RectF
 import android.graphics.pdf.PdfRenderer
 import android.os.Handler
@@ -19,23 +19,16 @@ import android.view.View
 import android.widget.OverScroller
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
-import java.util.concurrent.RejectedExecutionException
-import kotlin.math.abs
 import kotlin.math.max
+import kotlin.math.min
 
 class PdfDocumentView(context: Context) : View(context) {
 
     companion object {
         private const val TAG = "PdfDocumentView"
-
-        private const val MAX_BITMAP_WIDTH = 2400
-        private const val MIN_BITMAP_WIDTH = 320
-        private const val RENDER_SCALE_EXTRA = 1.2f
-        private const val ZOOM_BUCKET_STEP = 0.25f
+        private const val MAX_BITMAP_WIDTH = 2000
         private const val MIN_ZOOM = 1f
         private const val MAX_ZOOM = 4f
-        private const val ZOOM_DEBOUNCE_MS = 180L
-        private const val MAX_PENDING_RENDERS = 6
     }
 
     private val rendererLock = Any()
@@ -54,109 +47,106 @@ class PdfDocumentView(context: Context) : View(context) {
     private var zoom = 1f
     private var scrollOffset = 0f
     private var scrollXOffset = 0f
+
     private var lastX = 0f
     private var lastY = 0f
-    private var isScaling = false
 
-    private var pinchFocusX = 0f
-    private var pinchFocusY = 0f
+    private var isScaling = false
 
     private val pageGap = dp(12).toFloat()
     private val sidePadding = dp(12).toFloat()
 
-    private val bitmapCache: LruCache<Long, Bitmap>
-    private val pendingRenders: MutableSet<Long> = ConcurrentHashMap.newKeySet()
-
     private val mainHandler = Handler(Looper.getMainLooper())
+
     private val renderExecutor = Executors.newSingleThreadExecutor()
 
-    @Volatile
-    private var redrawPending = false
+    private val pendingRenders: MutableSet<Int> =
+        ConcurrentHashMap.newKeySet()
 
-    private fun requestRedraw() {
-        if (isReleased) return
-        if (redrawPending) return
-        redrawPending = true
-
-        mainHandler.post {
-            redrawPending = false
-            if (!isReleased && !isScaling) {
-                invalidate()
-            }
-        }
-    }
-
-    private fun evictStaleZoomCache() {
-    // Jangan hapus bitmap lama saat zoom.
-    // Bitmap lama tetap dipakai sementara bitmap baru dirender.
-}
-
-    private val zoomDebounceTask = Runnable {
-        if (isReleased) return@Runnable
-        evictStaleZoomCache()
-        requestRedraw()
-    }
+    private val bitmapCache: LruCache<Int, Bitmap>
 
     private val scroller = OverScroller(context)
+
     private var velocityTracker: VelocityTracker? = null
 
-    private val pagePaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG).apply {
-        isFilterBitmap = true
-        isAntiAlias = true
-        isDither = true
-    }
-
-    private val placeholderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.rgb(245, 245, 245)
-    }
-
-    private val scaleDetector = ScaleGestureDetector(
-        context,
-        object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
-
-            override fun onScaleBegin(detector: ScaleGestureDetector): Boolean {
-                isScaling = true
-                scroller.abortAnimation()
-
-                pinchFocusX = detector.focusX
-                pinchFocusY = detector.focusY
-
-                mainHandler.removeCallbacks(zoomDebounceTask)
-                return true
-            }
-
-            override fun onScale(detector: ScaleGestureDetector): Boolean {
-                val targetZoom = (zoom * detector.scaleFactor).coerceIn(MIN_ZOOM, MAX_ZOOM)
-                if (abs(targetZoom - zoom) < 0.01f) return true
-
-                applyFocalZoom(targetZoom, pinchFocusX, pinchFocusY)
-                requestRedraw()
-                return true
-            }
-
-            override fun onScaleEnd(detector: ScaleGestureDetector) {
-                isScaling = false
-                mainHandler.removeCallbacks(zoomDebounceTask)
-                mainHandler.postDelayed(zoomDebounceTask, ZOOM_DEBOUNCE_MS)
-            }
+    private val pagePaint =
+        Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG).apply {
+            isFilterBitmap = true
+            isDither = true
         }
-    )
+
+    private val placeholderPaint =
+        Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+        }
+
+    private val scaleDetector =
+        ScaleGestureDetector(
+            context,
+            object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+
+                override fun onScaleBegin(
+                    detector: ScaleGestureDetector
+                ): Boolean {
+                    isScaling = true
+                    scroller.abortAnimation()
+                    return true
+                }
+
+                override fun onScale(
+                    detector: ScaleGestureDetector
+                ): Boolean {
+
+                    val newZoom = (
+                        zoom * detector.scaleFactor
+                    ).coerceIn(MIN_ZOOM, MAX_ZOOM)
+
+                    applyFocalZoom(
+                        newZoom,
+                        detector.focusX,
+                        detector.focusY
+                    )
+
+                    postInvalidateOnAnimation()
+
+                    return true
+                }
+
+                override fun onScaleEnd(
+                    detector: ScaleGestureDetector
+                ) {
+                    isScaling = false
+                    invalidate()
+                }
+            }
+        )
 
     init {
-        val cacheKb = (Runtime.getRuntime().maxMemory() / 1024 / 6).toInt().coerceAtLeast(4096)
 
-        bitmapCache = object : LruCache<Long, Bitmap>(cacheKb) {
-            override fun sizeOf(key: Long, value: Bitmap): Int {
+        val cacheKb = (
+            Runtime.getRuntime().maxMemory() / 1024 / 6
+        ).toInt().coerceAtLeast(8192)
+
+        bitmapCache = object : LruCache<Int, Bitmap>(cacheKb) {
+
+            override fun sizeOf(
+                key: Int,
+                value: Bitmap
+            ): Int {
                 return (value.byteCount / 1024).coerceAtLeast(1)
             }
 
             override fun entryRemoved(
                 evicted: Boolean,
-                key: Long,
+                key: Int,
                 oldValue: Bitmap,
                 newValue: Bitmap?
             ) {
-                if (evicted && oldValue !== newValue && !oldValue.isRecycled) {
+                if (
+                    evicted &&
+                    oldValue !== newValue &&
+                    !oldValue.isRecycled
+                ) {
                     oldValue.recycle()
                 }
             }
@@ -165,397 +155,570 @@ class PdfDocumentView(context: Context) : View(context) {
         isFocusable = true
     }
 
-    private fun dp(value: Int): Int =
-        (value * resources.displayMetrics.density).toInt()
-
-    private fun bitmapMaxWidthForCurrentZoom(): Int {
-        return when {
-            zoom >= 3f -> 1600
-            zoom >= 2f -> 1800
-            else -> MAX_BITMAP_WIDTH
-        }
+    private fun dp(value: Int): Int {
+        return (
+            value * resources.displayMetrics.density
+        ).toInt()
     }
 
+    // ==================================================
+    // PDF RENDERER
+    // ==================================================
+
     fun setRenderer(newRenderer: PdfRenderer?) {
+
         if (isReleased) return
 
         synchronized(rendererLock) {
+
             generation++
+
             pdf = null
+
             pendingRenders.clear()
             bitmapCache.evictAll()
+
             pageSizes.clear()
 
+            zoom = 1f
             scrollOffset = 0f
             scrollXOffset = 0f
-            zoom = 1f
+
             scroller.abortAnimation()
 
             if (newRenderer != null) {
+
                 try {
+
                     for (i in 0 until newRenderer.pageCount) {
+
                         val page = newRenderer.openPage(i)
+
                         try {
-                            if (page.width > 0 && page.height > 0) {
-                                pageSizes.add(Pair(page.width, page.height))
-                            }
+                            pageSizes.add(
+                                Pair(page.width, page.height)
+                            )
                         } finally {
                             page.close()
                         }
                     }
+
                     pdf = newRenderer
+
                 } catch (e: Exception) {
-                    Log.e(TAG, "Gagal membaca metadata PDF", e)
+
+                    Log.e(TAG, "Gagal membaca PDF", e)
+
                     pageSizes.clear()
                     pdf = null
                 }
             }
         }
 
-        requestRedraw()
+        invalidate()
     }
 
     fun fitToScreen() {
+
         zoom = 1f
         scrollOffset = 0f
         scrollXOffset = 0f
+
         scroller.abortAnimation()
-        mainHandler.removeCallbacks(zoomDebounceTask)
-        evictStaleZoomCache()
-        requestRedraw()
+
+        invalidate()
     }
 
-    private fun basePageWidth(): Float =
-        (width - sidePadding * 2).coerceAtLeast(1f)
+    // ==================================================
+    // UKURAN HALAMAN
+    // ==================================================
 
-    private fun pageHeight(index: Int, pageWidth: Float): Float {
+    private fun basePageWidth(): Float {
+        return (
+            width - sidePadding * 2
+        ).coerceAtLeast(1f)
+    }
+
+    private fun pageHeight(
+        index: Int,
+        pageWidth: Float
+    ): Float {
+
         val size = pageSizes[index]
-        return pageWidth * size.second / size.first
+
+        return pageWidth *
+            size.second.toFloat() /
+            size.first.toFloat()
     }
 
     private fun totalDocumentHeight(): Float {
+
         if (pageSizes.isEmpty()) return 0f
 
         val pageWidth = basePageWidth() * zoom
+
         var total = pageGap * zoom
+
         for (i in pageSizes.indices) {
+
             total += pageHeight(i, pageWidth)
             total += pageGap * zoom
         }
+
         return total
     }
 
-    private fun maxScroll(): Int =
-        max(0f, totalDocumentHeight() - height).toInt()
+    private fun maxScroll(): Int {
 
-    private fun maxScrollX(): Int =
-    max(
-        0f,
-        (basePageWidth() * zoom - width) / 2f
-    ).toInt()
-
-    private fun clampScroll() {
-        scrollOffset = scrollOffset.coerceIn(0f, maxScroll().toFloat())
-        val maxX = maxScrollX().toFloat()
-        if (maxX > 0f) {
-            scrollXOffset = scrollXOffset.coerceIn(-maxX, maxX)
-        } else {
-            scrollXOffset = 0f
-        }
+        return max(
+            0f,
+            totalDocumentHeight() - height
+        ).toInt()
     }
 
-    private fun zoomBucket(z: Float): Int =
-        (z / ZOOM_BUCKET_STEP).toInt()
+    // Jarak geser kiri dan kanan dari posisi tengah.
+    private fun maxScrollX(): Int {
 
-    private fun cacheKey(pageIndex: Int, bucket: Int): Long =
-        (bucket.toLong() shl 32) or (pageIndex.toLong() and 0xffffffffL)
+        return max(
+            0f,
+            (basePageWidth() * zoom - width) / 2f
+        ).toInt()
+    }
+
+    private fun clampScroll() {
+
+        scrollOffset = scrollOffset.coerceIn(
+            0f,
+            maxScroll().toFloat()
+        )
+
+        val maxX = maxScrollX().toFloat()
+
+        scrollXOffset = scrollXOffset.coerceIn(
+            -maxX,
+            maxX
+        )
+    }
+
+    // ==================================================
+    // ZOOM DENGAN TITIK FOKUS
+    // ==================================================
 
     private fun applyFocalZoom(
-    targetZoom: Float,
-    focusX: Float,
-    focusY: Float
-) {
-    val newZoom = targetZoom.coerceIn(MIN_ZOOM, MAX_ZOOM)
+        newZoom: Float,
+        focusX: Float,
+        focusY: Float
+    ) {
 
-    if (newZoom == zoom) return
+        val targetZoom = newZoom.coerceIn(
+            MIN_ZOOM,
+            MAX_ZOOM
+        )
 
-    val oldZoom = zoom
+        if (targetZoom == zoom) return
 
-    val oldLeft =
-        (width - basePageWidth() * oldZoom) / 2f +
-            scrollXOffset
+        val oldZoom = zoom
 
-    val documentX = (focusX - oldLeft) / oldZoom
-    val documentY = (scrollOffset + focusY) / oldZoom
+        val oldLeft =
+            (width - basePageWidth() * oldZoom) / 2f +
+                scrollXOffset
 
-    zoom = newZoom
+        val documentX =
+            (focusX - oldLeft) / oldZoom
 
-    val newLeft =
-        (width - basePageWidth() * newZoom) / 2f
+        val documentY =
+            (scrollOffset + focusY) / oldZoom
 
-    scrollXOffset =
-        focusX - newLeft - documentX * newZoom
+        zoom = targetZoom
 
-    scrollOffset =
-        documentY * newZoom - focusY
+        val newLeft =
+            (width - basePageWidth() * zoom) / 2f
 
-    clampScroll()
-}
+        scrollXOffset =
+            focusX - newLeft - documentX * zoom
+
+        scrollOffset =
+            documentY * zoom - focusY
+
+        clampScroll()
+    }
+
+    // ==================================================
+    // RENDER SATU KALI PER HALAMAN
+    // ==================================================
 
     private fun requestRender(index: Int) {
-        if (isReleased || isScaling) return
-        if (index !in pageSizes.indices) return
-        if (pendingRenders.size >= MAX_PENDING_RENDERS) return
 
-        val bucket = zoomBucket(zoom)
-        val key = cacheKey(index, bucket)
-        if (bitmapCache.get(key) != null) return
-        if (!pendingRenders.add(key)) return
+        if (isReleased) return
+        if (index !in pageSizes.indices) return
+
+        // Tidak ada cache berdasarkan tingkat zoom.
+        if (bitmapCache.get(index) != null) return
+
+        if (!pendingRenders.add(index)) return
 
         val version = generation
-        val snapshotZoom = bucket * ZOOM_BUCKET_STEP
-        val snapshotBaseWidth = basePageWidth()
+
+        // Lebar ditentukan sekali, bukan berubah mengikuti zoom.
+        val targetWidth = min(
+            MAX_BITMAP_WIDTH,
+            max(
+                800,
+                ((width - sidePadding * 2) * 2f).toInt()
+            )
+        )
 
         try {
+
             renderExecutor.execute {
+
                 var result: Bitmap? = null
 
                 try {
+
                     synchronized(rendererLock) {
-                        if (isReleased || generation != version) return@synchronized
 
-                        val activeRenderer = pdf ?: return@synchronized
-                        val page = activeRenderer.openPage(index)
+                        if (
+                            isReleased ||
+                            generation != version
+                        ) {
+                            return@synchronized
+                        }
+
+                        val renderer = pdf
+                            ?: return@synchronized
+
+                        val page = renderer.openPage(index)
+
                         try {
-                            if (page.width <= 0 || page.height <= 0) return@synchronized
 
-                            val targetMaxWidth = bitmapMaxWidthForCurrentZoom()
-                            val desiredWidth =
-                                (snapshotBaseWidth * snapshotZoom * RENDER_SCALE_EXTRA).toInt()
-                            val targetWidth = desiredWidth
-                                .coerceIn(MIN_BITMAP_WIDTH, targetMaxWidth)
+                            val ratio =
+                                page.height.toFloat() /
+                                    page.width.toFloat()
 
-                            val ratio = page.height.toFloat() / page.width.toFloat()
-                            if (!ratio.isFinite() || ratio <= 0f) return@synchronized
+                            if (
+                                !ratio.isFinite() ||
+                                ratio <= 0f
+                            ) {
+                                return@synchronized
+                            }
 
-                            val targetHeight = (targetWidth * ratio).toInt().coerceAtLeast(1)
+                            val targetHeight = (
+                                targetWidth * ratio
+                            ).toInt().coerceAtLeast(1)
 
-                            val bmp = Bitmap.createBitmap(
+                            val bitmap = Bitmap.createBitmap(
                                 targetWidth,
                                 targetHeight,
                                 Bitmap.Config.ARGB_8888
                             )
-                            bmp.eraseColor(Color.WHITE)
 
-                            val dest = Rect(0, 0, targetWidth, targetHeight)
+                            bitmap.eraseColor(Color.WHITE)
+
                             page.render(
-                                bmp,
-                                dest,
+                                bitmap,
+                                null,
                                 null,
                                 PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY
                             )
 
-                            result = bmp
+                            result = bitmap
+
                         } finally {
-                            try { page.close() } catch (_: Exception) {}
+                            page.close()
                         }
                     }
-                } catch (ise: IllegalStateException) {
-                    Log.w(TAG, "Renderer closed saat render halaman $index", ise)
-                } catch (t: Throwable) {
-                    Log.e(TAG, "Gagal render halaman $index", t)
-                } finally {
-                    val finalBitmap = result
-                    mainHandler.post {
-                        pendingRenders.remove(key)
 
-                        if (isReleased || generation != version) {
-                            finalBitmap?.recycle()
-                            return@post
-                        }
+                } catch (e: Exception) {
 
-                        if (finalBitmap != null && !finalBitmap.isRecycled &&
-                            zoomBucket(zoom) == bucket
-                        ) {
-                            bitmapCache.put(key, finalBitmap)
-                        } else {
-                            finalBitmap?.recycle()
-                        }
+                    Log.e(
+                        TAG,
+                        "Render halaman $index gagal",
+                        e
+                    )
+                }
+
+                val finalBitmap = result
+
+                mainHandler.post {
+
+                    pendingRenders.remove(index)
+
+                    if (
+                        isReleased ||
+                        generation != version
+                    ) {
+                        finalBitmap?.recycle()
+                        return@post
+                    }
+
+                    if (
+                        finalBitmap != null &&
+                        !finalBitmap.isRecycled
+                    ) {
+                        bitmapCache.put(index, finalBitmap)
+                        invalidate()
                     }
                 }
             }
-        } catch (re: RejectedExecutionException) {
-            pendingRenders.remove(key)
+
+        } catch (e: Exception) {
+
+            pendingRenders.remove(index)
+
+            Log.e(TAG, "Antrean render gagal", e)
         }
     }
 
+    // ==================================================
+    // MENGGAMBAR PDF
+    // ==================================================
+
     override fun onDraw(canvas: Canvas) {
+
         super.onDraw(canvas)
+
         canvas.drawColor(Color.rgb(35, 42, 55))
 
         if (pageSizes.isEmpty()) return
 
         val scaledWidth = basePageWidth() * zoom
-        val left = (width - scaledWidth) / 2f + scrollXOffset
-        var top = pageGap * zoom - scrollOffset
 
-        val bucket = zoomBucket(zoom)
+        val left =
+            (width - scaledWidth) / 2f +
+                scrollXOffset
+
+        var top = pageGap * zoom - scrollOffset
 
         var firstVisible = -1
         var lastVisible = -1
 
         for (i in pageSizes.indices) {
-            val scaledHeight = pageHeight(i, scaledWidth)
+
+            val scaledHeight = pageHeight(
+                i,
+                scaledWidth
+            )
+
             val bottom = top + scaledHeight
 
-            if (bottom >= 0f && top <= height.toFloat()) {
-                if (firstVisible == -1) firstVisible = i
+            if (
+                bottom >= 0f &&
+                top <= height.toFloat()
+            ) {
+
+                if (firstVisible == -1) {
+                    firstVisible = i
+                }
+
                 lastVisible = i
 
-                val rect = RectF(left, top, left + scaledWidth, bottom)
-                val key = cacheKey(i, bucket)
+                val rect = RectF(
+                    left,
+                    top,
+                    left + scaledWidth,
+                    bottom
+                )
 
-var bitmap = bitmapCache.get(key)
+                // Latar halaman selalu putih.
+                canvas.drawRect(
+                    rect,
+                    placeholderPaint
+                )
 
-// Jika bitmap untuk zoom baru belum tersedia,
-// gunakan bitmap lama agar teks tidak menghilang.
-if (bitmap == null || bitmap.isRecycled) {
-    val oldBitmap = bitmapCache.snapshot().entries
-        .firstOrNull { entry ->
-            (entry.key and 0xffffffffL) == i.toLong() &&
-                !entry.value.isRecycled
-        }
+                // Bitmap yang sama digunakan untuk semua zoom.
+                val bitmap = bitmapCache.get(i)
 
-    bitmap = oldBitmap?.value
-}
-
-if (bitmap != null && !bitmap.isRecycled) {
-    canvas.drawBitmap(bitmap, null, rect, pagePaint)
-} else {
-    canvas.drawRect(rect, placeholderPaint)
-}
+                if (
+                    bitmap != null &&
+                    !bitmap.isRecycled
+                ) {
+                    canvas.drawBitmap(
+                        bitmap,
+                        null,
+                        rect,
+                        pagePaint
+                    )
+                }
             }
 
             top = bottom + pageGap * zoom
         }
 
-        if (!isScaling && firstVisible >= 0) {
-            for (i in firstVisible..lastVisible) requestRender(i)
-            if (firstVisible > 0) requestRender(firstVisible - 1)
-            if (lastVisible < pageSizes.size - 1) requestRender(lastVisible + 1)
+        // Render halaman terlihat dan tetangganya.
+        if (firstVisible >= 0) {
+
+            for (i in firstVisible..lastVisible) {
+                requestRender(i)
+            }
+
+            requestRender(firstVisible - 1)
+            requestRender(lastVisible + 1)
         }
     }
 
+    // ==================================================
+    // SCROLL FLING
+    // ==================================================
+
     override fun computeScroll() {
+
         if (scroller.computeScrollOffset()) {
+
+            scrollXOffset = scroller.currX.toFloat()
             scrollOffset = scroller.currY.toFloat()
+
             clampScroll()
+
             postInvalidateOnAnimation()
         }
     }
 
-    override fun onTouchEvent(event: MotionEvent): Boolean {
+    // ==================================================
+    // SENTUHAN DAN GESER
+    // ==================================================
+
+    override fun onTouchEvent(
+        event: MotionEvent
+    ): Boolean {
+
         if (isReleased) return false
 
         scaleDetector.onTouchEvent(event)
 
         when (event.actionMasked) {
+
             MotionEvent.ACTION_DOWN -> {
+
                 scroller.abortAnimation()
+
                 velocityTracker?.recycle()
-                velocityTracker = VelocityTracker.obtain().apply { addMovement(event) }
+
+                velocityTracker =
+                    VelocityTracker.obtain()
+
+                velocityTracker?.addMovement(event)
+
                 lastX = event.x
                 lastY = event.y
+
                 parent?.requestDisallowInterceptTouchEvent(true)
+
                 return true
             }
 
             MotionEvent.ACTION_POINTER_DOWN -> {
-                isScaling = true
+
                 velocityTracker?.addMovement(event)
+
                 return true
             }
 
             MotionEvent.ACTION_MOVE -> {
+
                 velocityTracker?.addMovement(event)
 
-                if (!isScaling && !scaleDetector.isInProgress && event.pointerCount == 1) {
-                    val deltaX = event.x - lastX
-                    val deltaY = event.y - lastY
+                if (
+                    !scaleDetector.isInProgress &&
+                    !isScaling &&
+                    event.pointerCount == 1
+                ) {
 
-                    val canPanX = zoom > 1.15f && maxScrollX() > 0
-                    val canPanY = maxScroll() > 0
+                    val dx = event.x - lastX
+                    val dy = event.y - lastY
 
-                    val horizontalIntent = canPanX && abs(deltaX) > abs(deltaY) * 1.2f
-                    val verticalIntent = canPanY && abs(deltaY) >= abs(deltaX) * 1.2f
-
-                    when {
-                        horizontalIntent -> {
-                            scrollXOffset += deltaX
-                            clampScroll()
-                        }
-                        verticalIntent -> {
-                            scrollOffset -= deltaY
-                            clampScroll()
-                        }
+                    // Zoom normal: scroll vertikal.
+                    // Zoom diperbesar: bisa geser horizontal
+                    // sekaligus vertikal.
+                    if (zoom > 1.01f) {
+                        scrollXOffset += dx
                     }
+
+                    scrollOffset -= dy
+
+                    clampScroll()
 
                     postInvalidateOnAnimation()
                 }
 
                 lastX = event.x
                 lastY = event.y
+
                 return true
             }
 
             MotionEvent.ACTION_POINTER_UP -> {
-                lastX = event.getX(if (event.actionIndex == 0) 1 else 0)
-                lastY = event.getY(if (event.actionIndex == 0) 1 else 0)
+
+                val remainingIndex =
+                    if (event.actionIndex == 0) 1 else 0
+
+                if (remainingIndex < event.pointerCount) {
+
+                    lastX = event.getX(remainingIndex)
+                    lastY = event.getY(remainingIndex)
+                }
+
                 return true
             }
 
             MotionEvent.ACTION_UP -> {
+
                 velocityTracker?.addMovement(event)
+
                 velocityTracker?.computeCurrentVelocity(1000)
 
-                if (!isScaling && !scaleDetector.isInProgress) {
-                    val velocityY = -(velocityTracker?.yVelocity ?: 0f)
-                    val velocityX = -(velocityTracker?.xVelocity ?: 0f)
+                if (
+                    !scaleDetector.isInProgress &&
+                    !isScaling
+                ) {
 
-                    if (abs(velocityY) > 100f) {
+                    val velocityX =
+                        velocityTracker?.xVelocity ?: 0f
+
+                    val velocityY =
+                        -(velocityTracker?.yVelocity ?: 0f)
+
+                    if (
+                        kotlin.math.abs(velocityX) > 100f ||
+                        kotlin.math.abs(velocityY) > 100f
+                    ) {
+
                         scroller.fling(
-                            0,
+                            scrollXOffset.toInt(),
                             scrollOffset.toInt(),
-                            0,
+                            if (zoom > 1.01f) velocityX.toInt() else 0,
                             velocityY.toInt(),
-                            0,
-                            0,
+                            -maxScrollX(),
+                            maxScrollX(),
                             0,
                             maxScroll()
                         )
-                        postInvalidateOnAnimation()
-                    }
 
-                    if (zoom > 1.15f && abs(velocityX) > 120f && maxScrollX() > 0) {
-                        scrollXOffset += velocityX / 12f
-                        clampScroll()
                         postInvalidateOnAnimation()
                     }
                 }
 
                 velocityTracker?.recycle()
                 velocityTracker = null
+
                 isScaling = false
+
                 parent?.requestDisallowInterceptTouchEvent(false)
+
                 performClick()
+
                 return true
             }
 
             MotionEvent.ACTION_CANCEL -> {
+
                 velocityTracker?.recycle()
                 velocityTracker = null
+
                 isScaling = false
+
                 parent?.requestDisallowInterceptTouchEvent(false)
+
                 return true
             }
         }
@@ -568,25 +731,34 @@ if (bitmap != null && !bitmap.isRecycled) {
         return true
     }
 
+    // ==================================================
+    // RELEASE
+    // ==================================================
+
     fun release() {
+
         if (isReleased) return
 
         synchronized(rendererLock) {
+
             isReleased = true
             generation++
+
             pdf = null
+
             pageSizes.clear()
             pendingRenders.clear()
+
             bitmapCache.evictAll()
         }
 
-        mainHandler.removeCallbacks(zoomDebounceTask)
-        mainHandler.removeCallbacksAndMessages(null)
-
         scroller.abortAnimation()
+
         velocityTracker?.recycle()
         velocityTracker = null
 
         renderExecutor.shutdownNow()
+
+        mainHandler.removeCallbacksAndMessages(null)
     }
 }
