@@ -29,46 +29,32 @@ class PdfDocumentView(context: Context) : View(context) {
     companion object {
         private const val TAG = "PdfDocumentView"
 
-        // Resolusi bitmap maksimum (px). Lebih tinggi = lebih tajam saat zoom,
-        // tapi lebih boros RAM. 2400 cukup untuk HP modern.
         private const val MAX_BITMAP_WIDTH = 2400
         private const val MIN_BITMAP_WIDTH = 320
-
-        // Skala ekstra agar tidak blur saat user zoom sedikit di atas bucket.
         private const val RENDER_SCALE_EXTRA = 1.35f
-
-        // Bucket zoom (step 0.25): 1.0, 1.25, 1.5, ..., 4.0
         private const val ZOOM_BUCKET_STEP = 0.25f
         private const val MIN_ZOOM = 1f
         private const val MAX_ZOOM = 4f
-
-        // Debounce setelah pinch berhenti sebelum render ulang.
         private const val ZOOM_DEBOUNCE_MS = 200L
     }
-
-    // ---------------- Renderer & metadata ----------------
 
     private val rendererLock = Any()
 
     @Volatile
     private var pdf: PdfRenderer? = null
-
     private val pageSizes = mutableListOf<Pair<Int, Int>>()
-
     @Volatile
     private var generation = 0L
-
     @Volatile
     private var isReleased = false
 
-    // ---------------- State UI ----------------
-
     private var zoom = 1f
     private var scrollOffset = 0f
+    private var scrollXOffset = 0f
     private var lastY = 0f
+    private var lastX = 0f
     private var isScaling = false
 
-    // Titik fokus pinch (koordinat layar)
     private var pinchFocusX = 0f
     private var pinchFocusY = 0f
     private var pinchStartZoom = 1f
@@ -77,14 +63,8 @@ class PdfDocumentView(context: Context) : View(context) {
     private val pageGap = dp(12).toFloat()
     private val sidePadding = dp(12).toFloat()
 
-    // ---------------- Cache ----------------
-
-    // Key: (zoomBucket shl 32) or pageIndex  ->  Bitmap
     private val bitmapCache: LruCache<Long, Bitmap>
-
     private val pendingRenders: MutableSet<Long> = ConcurrentHashMap.newKeySet()
-
-    // ---------------- Threading ----------------
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private val renderExecutor = Executors.newFixedThreadPool(2)
@@ -124,8 +104,6 @@ class PdfDocumentView(context: Context) : View(context) {
 
     private val scroller = OverScroller(context)
     private var velocityTracker: VelocityTracker? = null
-
-    // ---------------- Paint ----------------
 
     private val pagePaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG).apply {
         isFilterBitmap = true
@@ -200,10 +178,6 @@ class PdfDocumentView(context: Context) : View(context) {
     private fun dp(value: Int): Int =
         (value * resources.displayMetrics.density).toInt()
 
-    // ============================================================
-    // Public API
-    // ============================================================
-
     fun setRenderer(newRenderer: PdfRenderer?) {
         if (isReleased) return
 
@@ -216,7 +190,7 @@ class PdfDocumentView(context: Context) : View(context) {
             pageSizes.clear()
 
             scrollOffset = 0f
-            zoom = 1f
+            scrollXOffset = 0f
             scroller.abortAnimation()
 
             if (newRenderer != null) {
@@ -246,15 +220,12 @@ class PdfDocumentView(context: Context) : View(context) {
     fun fitToScreen() {
         zoom = 1f
         scrollOffset = 0f
+        scrollXOffset = 0f
         scroller.abortAnimation()
         mainHandler.removeCallbacks(zoomDebounceTask)
         evictStaleZoomCache()
         scheduleInvalidate()
     }
-
-    // ============================================================
-    // Geometri
-    // ============================================================
 
     private fun basePageWidth(): Float =
         (width - sidePadding * 2).coerceAtLeast(1f)
@@ -278,8 +249,17 @@ class PdfDocumentView(context: Context) : View(context) {
     private fun maxScroll(): Int =
         max(0f, totalDocumentHeight() - height).toInt()
 
+    private fun maxScrollX(): Int =
+        max(0f, (basePageWidth() * zoom) - width).toInt()
+
     private fun clampScroll() {
         scrollOffset = scrollOffset.coerceIn(0f, maxScroll().toFloat())
+        val maxX = maxScrollX().toFloat()
+        if (maxX > 0f) {
+            scrollXOffset = scrollXOffset.coerceIn(-maxX, maxX)
+        } else {
+            scrollXOffset = 0f
+        }
     }
 
     private fun zoomBucket(z: Float): Int {
@@ -307,10 +287,6 @@ class PdfDocumentView(context: Context) : View(context) {
 
         clampScroll()
     }
-
-    // ============================================================
-    // Render background
-    // ============================================================
 
     private fun requestRender(index: Int) {
         if (isReleased || isScaling) return
@@ -400,10 +376,6 @@ class PdfDocumentView(context: Context) : View(context) {
         }
     }
 
-    // ============================================================
-    // Drawing
-    // ============================================================
-
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
         canvas.drawColor(Color.rgb(35, 42, 55))
@@ -411,7 +383,7 @@ class PdfDocumentView(context: Context) : View(context) {
         if (pageSizes.isEmpty()) return
 
         val scaledWidth = basePageWidth() * zoom
-        val left = (width - scaledWidth) / 2f
+        val left = (width - scaledWidth) / 2f + scrollXOffset
         var top = pageGap * zoom - scrollOffset
 
         val bucket = zoomBucket(zoom)
@@ -448,10 +420,6 @@ class PdfDocumentView(context: Context) : View(context) {
         }
     }
 
-    // ============================================================
-    // Scroll animation
-    // ============================================================
-
     override fun computeScroll() {
         if (scroller.computeScrollOffset()) {
             scrollOffset = scroller.currY.toFloat()
@@ -459,10 +427,6 @@ class PdfDocumentView(context: Context) : View(context) {
             postInvalidateOnAnimation()
         }
     }
-
-    // ============================================================
-    // Touch: scroll + pinch zoom
-    // ============================================================
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
         if (isReleased) return false
@@ -475,6 +439,7 @@ class PdfDocumentView(context: Context) : View(context) {
                 velocityTracker?.recycle()
                 velocityTracker = VelocityTracker.obtain().apply { addMovement(event) }
                 lastY = event.y
+                lastX = event.x
                 parent?.requestDisallowInterceptTouchEvent(true)
                 return true
             }
@@ -489,16 +454,27 @@ class PdfDocumentView(context: Context) : View(context) {
                 velocityTracker?.addMovement(event)
 
                 if (!isScaling && !scaleDetector.isInProgress && event.pointerCount == 1) {
+                    val deltaX = event.x - lastX
                     val deltaY = event.y - lastY
-                    scrollOffset -= deltaY
-                    clampScroll()
+
+                    if (abs(deltaX) > abs(deltaY)) {
+                        scrollXOffset += deltaX
+                        clampScroll()
+                    } else {
+                        scrollOffset -= deltaY
+                        clampScroll()
+                    }
+
                     postInvalidateOnAnimation()
                 }
+
+                lastX = event.x
                 lastY = event.y
                 return true
             }
 
             MotionEvent.ACTION_POINTER_UP -> {
+                lastX = event.getX(if (event.actionIndex == 0) 1 else 0)
                 lastY = event.getY(if (event.actionIndex == 0) 1 else 0)
                 return true
             }
@@ -509,6 +485,8 @@ class PdfDocumentView(context: Context) : View(context) {
 
                 if (!isScaling && !scaleDetector.isInProgress) {
                     val velocityY = -(velocityTracker?.yVelocity ?: 0f)
+                    val velocityX = -(velocityTracker?.xVelocity ?: 0f)
+
                     if (abs(velocityY) > 100f) {
                         scroller.fling(
                             0, scrollOffset.toInt(),
@@ -517,6 +495,15 @@ class PdfDocumentView(context: Context) : View(context) {
                             0, maxScroll()
                         )
                         postInvalidateOnAnimation()
+                    }
+
+                    if (abs(velocityX) > 120f) {
+                        val maxX = maxScrollX().toFloat()
+                        if (maxX > 0f) {
+                            scrollXOffset += velocityX / 12f
+                            clampScroll()
+                            postInvalidateOnAnimation()
+                        }
                     }
                 }
 
@@ -543,10 +530,6 @@ class PdfDocumentView(context: Context) : View(context) {
         super.performClick()
         return true
     }
-
-    // ============================================================
-    // Release
-    // ============================================================
 
     fun release() {
         if (isReleased) return
