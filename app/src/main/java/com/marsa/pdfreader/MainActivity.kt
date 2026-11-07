@@ -4,6 +4,7 @@ import android.app.Activity
 import android.app.AlertDialog
 import android.content.Intent
 import android.database.Cursor
+import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
@@ -13,14 +14,19 @@ import android.os.Build
 import android.os.Bundle
 import android.os.ParcelFileDescriptor
 import android.provider.OpenableColumns
+import android.text.InputFilter
+import android.text.InputType
 import android.text.TextUtils
 import android.util.Log
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.widget.ArrayAdapter
+import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.PopupMenu
+import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 
@@ -29,6 +35,9 @@ class MainActivity : Activity() {
     private var descriptor: ParcelFileDescriptor? = null
     private var renderer: PdfRenderer? = null
     private var currentUri: Uri? = null
+
+    private var exportPage = 0
+    private var exportPng = true
 
     private lateinit var documentView: PdfDocumentView
     private lateinit var fileNameView: TextView
@@ -41,6 +50,7 @@ class MainActivity : Activity() {
 
     companion object {
         private const val PICK_PDF = 1001
+        private const val CREATE_IMAGE = 1002
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -192,6 +202,16 @@ class MainActivity : Activity() {
             true
         }
 
+        popup.menu.add("Simpan halaman sebagai gambar").setOnMenuItemClickListener {
+            showExportDialog()
+            true
+        }
+
+        popup.menu.add("Cetak PDF").setOnMenuItemClickListener {
+            startPrintFlow()
+            true
+        }
+
         popup.menu.add("Fit to Screen").setOnMenuItemClickListener {
             documentView.fitToScreen()
             true
@@ -242,6 +262,248 @@ class MainActivity : Activity() {
             data?.data != null
         ) {
             openPdf(data.data!!)
+        }
+
+        if (requestCode == CREATE_IMAGE &&
+            resultCode == RESULT_OK &&
+            data?.data != null
+        ) {
+            saveImage(data.data!!)
+        }
+    }
+
+    // ============================================================
+    // EXPORT HALAMAN KE GAMBAR (PNG / JPG)
+    // ============================================================
+
+    private fun showExportDialog() {
+        if (currentUri == null) {
+            Toast.makeText(this, "Belum ada PDF yang dibuka.", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        val page = documentView.currentPageIndex()
+
+        AlertDialog.Builder(this)
+            .setTitle("Simpan halaman ${page + 1} sebagai")
+            .setItems(arrayOf("PNG (tajam)", "JPG (lebih kecil)")) { _, which ->
+                startExport(page, which == 0)
+            }
+            .setNegativeButton("Batal", null)
+            .show()
+    }
+
+    private fun startExport(page: Int, png: Boolean) {
+        exportPage = page
+        exportPng = png
+
+        val ext = if (png) "png" else "jpg"
+        val baseName = fileNameView.text.toString().removeSuffix(".pdf")
+
+        val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = if (png) "image/png" else "image/jpeg"
+            putExtra(Intent.EXTRA_TITLE, "$baseName-hal${page + 1}.$ext")
+        }
+        startActivityForResult(intent, CREATE_IMAGE)
+    }
+
+    private fun saveImage(uri: Uri) {
+        val page = exportPage
+        val format =
+            if (exportPng) Bitmap.CompressFormat.PNG
+            else Bitmap.CompressFormat.JPEG
+
+        // Render + tulis file di thread background agar UI tidak macet.
+        Thread {
+            var ok = false
+
+            try {
+                val bmp = documentView.renderPageForExport(page, 2000)
+
+                if (bmp != null) {
+                    try {
+                        contentResolver.openOutputStream(uri)?.use { out ->
+                            ok = bmp.compress(format, 95, out)
+                        }
+                    } finally {
+                        bmp.recycle()
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e("MainActivity", "Gagal menyimpan gambar", e)
+            } catch (e: OutOfMemoryError) {
+                Log.e("MainActivity", "Memori habis saat export gambar", e)
+            }
+
+            runOnUiThread {
+                Toast.makeText(
+                    this,
+                    if (ok) "Gambar tersimpan" else "Gagal menyimpan gambar",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+        }.start()
+    }
+
+    // ============================================================
+    // CETAK KE SERVER (GURU)
+    // ============================================================
+
+    private fun toast(msg: String) {
+        Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+    }
+
+    private fun startPrintFlow() {
+        val uri = currentUri ?: run {
+            toast("Belum ada PDF yang dibuka.")
+            return
+        }
+
+        val size = try {
+            contentResolver.openFileDescriptor(uri, "r")?.use { it.statSize } ?: -1L
+        } catch (e: Exception) {
+            -1L
+        }
+
+        if (size > 20L * 1024 * 1024) {
+            toast("Ukuran PDF maksimal 20 MB.")
+            return
+        }
+
+        toast("Memuat printer...")
+
+        Thread {
+            try {
+                val printers = PrintClient.fetchPrinters()
+                runOnUiThread { showPrintDialog(uri, printers) }
+            } catch (e: Exception) {
+                runOnUiThread { toast("Gagal memuat printer: ${e.message}") }
+            }
+        }.start()
+    }
+
+    private fun showPrintDialog(uri: Uri, printers: List<PrintPrinter>) {
+        if (printers.isEmpty()) {
+            toast("Tidak ada printer yang online.")
+            return
+        }
+
+        val prefs = getSharedPreferences("print", MODE_PRIVATE)
+
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(8), dp(20), 0)
+        }
+
+        val spinner = Spinner(this).apply {
+            adapter = ArrayAdapter(
+                this@MainActivity,
+                android.R.layout.simple_spinner_dropdown_item,
+                printers.map {
+                    if (it.location.isBlank()) it.name else "${it.name} - ${it.location}"
+                }
+            )
+        }
+
+        val pinInput = EditText(this).apply {
+            hint = "PIN (5 digit)"
+            inputType = InputType.TYPE_CLASS_NUMBER or
+                InputType.TYPE_NUMBER_VARIATION_PASSWORD
+            filters = arrayOf(InputFilter.LengthFilter(5))
+            setText(prefs.getString("pin", ""))
+        }
+
+        val copiesInput = EditText(this).apply {
+            hint = "Jumlah salinan (1-10)"
+            inputType = InputType.TYPE_CLASS_NUMBER
+            filters = arrayOf(InputFilter.LengthFilter(2))
+            setText("1")
+        }
+
+        box.addView(spinner)
+        box.addView(pinInput)
+        box.addView(copiesInput)
+
+        AlertDialog.Builder(this)
+            .setTitle("Cetak PDF")
+            .setView(box)
+            .setPositiveButton("Cetak") { _, _ ->
+                val pin = pinInput.text.toString().trim()
+                val copies = copiesInput.text.toString().toIntOrNull() ?: 0
+
+                if (!Regex("^[0-9]{5}$").matches(pin)) {
+                    toast("PIN harus 5 digit angka.")
+                    return@setPositiveButton
+                }
+
+                if (copies !in 1..10) {
+                    toast("Jumlah salinan harus 1-10.")
+                    return@setPositiveButton
+                }
+
+                submitPrint(
+                    uri,
+                    printers[spinner.selectedItemPosition].id,
+                    pin,
+                    copies
+                )
+            }
+            .setNegativeButton("Batal", null)
+            .show()
+    }
+
+    private fun submitPrint(uri: Uri, printerId: Int, pin: String, copies: Int) {
+        toast("Mengirim dokumen...")
+
+        Thread {
+            val result = try {
+                PrintClient.submit(this, uri, pin, printerId, copies)
+            } catch (e: Exception) {
+                PrintResult(false, "Gagal mengirim: ${e.message}")
+            }
+
+            if (!result.ok) {
+                runOnUiThread { toast(result.message) }
+                return@Thread
+            }
+
+            // PIN hanya disimpan setelah server menerimanya.
+            getSharedPreferences("print", MODE_PRIVATE)
+                .edit().putString("pin", pin).apply()
+
+            runOnUiThread { toast("Masuk antrean: ${result.printerName}") }
+
+            val token = result.statusToken
+            if (token != null) pollPrintStatus(token)
+        }.start()
+    }
+
+    // Berjalan di thread background: cek status tiap 3 detik, maksimal 90 detik.
+    private fun pollPrintStatus(token: String) {
+        val inProgress = setOf("pending", "processing", "printing")
+        var last = "pending"
+
+        repeat(30) {
+            try {
+                val st = PrintClient.fetchStatus(token)
+
+                if (st.status != last) {
+                    last = st.status
+                    runOnUiThread { toast("Status cetak: ${st.status}") }
+                }
+
+                if (st.status !in inProgress) {
+                    if (st.error != null) {
+                        runOnUiThread { toast("Gagal: ${st.error}") }
+                    }
+                    return
+                }
+            } catch (e: Exception) {
+                // abaikan, coba lagi pada putaran berikut
+            }
+
+            Thread.sleep(3000)
         }
     }
 
