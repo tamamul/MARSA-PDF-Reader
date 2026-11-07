@@ -1,4 +1,3 @@
-
 package com.marsa.pdfreader
 
 import android.content.Context
@@ -986,6 +985,38 @@ class PdfDocumentView(context: Context) : View(context) {
         super.performClick()
         return true
     }
+    
+    fun currentPageIndex(): Int {
+    if (pageSizes.isEmpty()) return 0
+    val scaledWidth = basePageWidth() * zoom
+    val middle = height / 2f
+    var top = pageGap * zoom - scrollOffset
+    for (i in pageSizes.indices) {
+        val bottom = top + pageHeight(i, scaledWidth)
+        if (middle <= bottom + pageGap * zoom / 2f) return i
+        top = bottom + pageGap * zoom
+    }
+    return pageSizes.lastIndex
+}
+
+fun renderPageForExport(index: Int, targetWidth: Int): Bitmap? {
+    synchronized(rendererLock) {
+        val renderer = pdf ?: return null
+        if (index !in pageSizes.indices) return null
+        val page = renderer.openPage(index)
+        try {
+            val ratio = page.height.toFloat() / page.width.toFloat()
+            var w = targetWidth
+            if (w * ratio > 4096f) w = (4096f / ratio).toInt()
+            w = w.coerceAtLeast(1)
+            val h = (w * ratio).toInt().coerceAtLeast(1)
+            val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+            bmp.eraseColor(Color.WHITE)
+            page.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+            return bmp
+        } finally { page.close() }
+    }
+}
 
     // ==================================================
     // RELEASE
