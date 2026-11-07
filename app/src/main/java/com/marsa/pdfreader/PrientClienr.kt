@@ -23,7 +23,7 @@ data class PrintStatus(val status: String, val error: String?)
 object PrintClient {
 
     // GANTI dengan domain server print Anda (wajib https).
-    private const val BASE_URL = "https://GANTI-DOMAIN-ANDA"
+    private const val BASE_URL = "https://chat.marsa9.com/printserver-ci4/public"
 
     private fun open(path: String, method: String): HttpURLConnection {
         val c = URL(BASE_URL + path).openConnection() as HttpURLConnection
