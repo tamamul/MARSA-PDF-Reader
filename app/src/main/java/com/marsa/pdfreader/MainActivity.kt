@@ -17,6 +17,7 @@ import android.provider.OpenableColumns
 import android.text.InputFilter
 import android.text.InputType
 import android.text.TextUtils
+import android.text.method.DigitsKeyListener
 import android.util.Log
 import android.view.Gravity
 import android.view.View
@@ -26,9 +27,14 @@ import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.PopupMenu
+import android.widget.ProgressBar
+import android.widget.ScrollView
 import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 class MainActivity : Activity() {
 
@@ -41,7 +47,15 @@ class MainActivity : Activity() {
 
     private lateinit var documentView: PdfDocumentView
     private lateinit var fileNameView: TextView
-    private lateinit var emptyView: TextView
+    private lateinit var emptyView: View
+    private lateinit var homeList: LinearLayout
+    private lateinit var pageView: TextView
+
+    private var nightMode = false
+
+    private var printDialog: AlertDialog? = null
+    private var printMessage: TextView? = null
+    private var printBar: ProgressBar? = null
 
     private val bg = Color.rgb(14, 19, 30)
     private val surface = Color.rgb(27, 35, 50)
@@ -60,6 +74,11 @@ class MainActivity : Activity() {
         window.navigationBarColor = bg
 
         buildInterface()
+
+        nightMode = getSharedPreferences("settings", MODE_PRIVATE)
+            .getBoolean("night", false)
+        documentView.setNightMode(nightMode)
+        refreshHome()
 
         // Jika activity di-recreate, ambil URI dari savedInstanceState
         val restoredUri = savedInstanceState?.getString("current_uri")
@@ -126,6 +145,26 @@ class MainActivity : Activity() {
             }
         )
 
+        pageView = TextView(this).apply {
+            textSize = 13f
+            gravity = Gravity.CENTER
+            setTextColor(textColor)
+            visibility = View.GONE
+            setPadding(dp(10), dp(4), dp(10), dp(4))
+            background = GradientDrawable().apply {
+                setColor(surface)
+                cornerRadius = dp(10).toFloat()
+            }
+            setOnClickListener { showJumpDialog() }
+        }
+        header.addView(
+            pageView,
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        )
+
         val menuButton = TextView(this).apply {
             text = "☰"
             textSize = 27f
@@ -157,20 +196,26 @@ class MainActivity : Activity() {
             )
         )
 
-        emptyView = TextView(this).apply {
-            text = "MARSA PDF Reader\n\nBuka dokumen PDF untuk mulai membaca."
-            textSize = 16f
-            gravity = Gravity.CENTER
-            setTextColor(Color.LTGRAY)
-            setLineSpacing(dp(6).toFloat(), 1f)
-            setPadding(dp(24), dp(24), dp(24), dp(24))
+        documentView.onPageChanged = { page, total ->
+            pageView.text = "${page + 1} / $total"
+            pageView.visibility = View.VISIBLE
         }
+
+        homeList = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(16), dp(16), dp(24))
+        }
+
+        emptyView = ScrollView(this).apply {
+            addView(homeList)
+        }
+
         viewer.addView(
             emptyView,
             FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { gravity = Gravity.CENTER }
+                ViewGroup.LayoutParams.MATCH_PARENT
+            )
         )
 
         root.addView(
@@ -197,6 +242,17 @@ class MainActivity : Activity() {
             true
         }
 
+        popup.menu.add("Lompat ke halaman").setOnMenuItemClickListener {
+            showJumpDialog()
+            true
+        }
+
+        popup.menu.add(if (nightMode) "Mode terang" else "Mode malam")
+            .setOnMenuItemClickListener {
+                toggleNightMode()
+                true
+            }
+
         popup.menu.add("Bagikan PDF").setOnMenuItemClickListener {
             sharePdf()
             true
@@ -214,6 +270,11 @@ class MainActivity : Activity() {
 
         popup.menu.add("Fit to Screen").setOnMenuItemClickListener {
             documentView.fitToScreen()
+            true
+        }
+
+        popup.menu.add("Tutup PDF (ke beranda)").setOnMenuItemClickListener {
+            closePdf()
             true
         }
 
@@ -354,8 +415,8 @@ class MainActivity : Activity() {
         Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
     }
 
-    private fun startPrintFlow() {
-        val uri = currentUri ?: run {
+    private fun startPrintFlow(target: Uri? = currentUri) {
+        val uri = target ?: run {
             toast("Belum ada PDF yang dibuka.")
             return
         }
@@ -385,7 +446,7 @@ class MainActivity : Activity() {
 
     private fun showPrintDialog(uri: Uri, printers: List<PrintPrinter>) {
         if (printers.isEmpty()) {
-            toast("Tidak ada printer yang online.")
+            toast("Belum ada printer terdaftar.")
             return
         }
 
@@ -401,7 +462,10 @@ class MainActivity : Activity() {
                 this@MainActivity,
                 android.R.layout.simple_spinner_dropdown_item,
                 printers.map {
-                    if (it.location.isBlank()) it.name else "${it.name} - ${it.location}"
+                    val label =
+                        if (it.location.isBlank()) it.name
+                        else "${it.name} - ${it.location}"
+                    if (it.online) "\u25CF $label" else "\u25CB $label (offline)"
                 }
             )
         }
@@ -421,9 +485,17 @@ class MainActivity : Activity() {
             setText("1")
         }
 
+        val rangeInput = EditText(this).apply {
+            hint = "Halaman (kosong = semua), mis. 1-3,5"
+            inputType = InputType.TYPE_CLASS_TEXT
+            keyListener = DigitsKeyListener.getInstance("0123456789,-")
+            filters = arrayOf(InputFilter.LengthFilter(50))
+        }
+
         box.addView(spinner)
         box.addView(pinInput)
         box.addView(copiesInput)
+        box.addView(rangeInput)
 
         AlertDialog.Builder(this)
             .setTitle("Cetak PDF")
@@ -442,29 +514,82 @@ class MainActivity : Activity() {
                     return@setPositiveButton
                 }
 
-                submitPrint(
-                    uri,
-                    printers[spinner.selectedItemPosition].id,
-                    pin,
-                    copies
-                )
+                val range = rangeInput.text.toString().trim()
+
+                if (range.isNotEmpty() &&
+                    !Regex("^[1-9][0-9]*(-[1-9][0-9]*)?(,[1-9][0-9]*(-[1-9][0-9]*)?)*$").matches(range)
+                ) {
+                    toast("Format halaman salah. Contoh: 1-3,5")
+                    return@setPositiveButton
+                }
+
+                val printer = printers[spinner.selectedItemPosition]
+
+                if (!printer.online) {
+                    toast("Printer sedang offline. Pilih printer lain.")
+                    return@setPositiveButton
+                }
+
+                submitPrint(uri, printer.id, pin, copies, range)
             }
             .setNegativeButton("Batal", null)
             .show()
     }
 
-    private fun submitPrint(uri: Uri, printerId: Int, pin: String, copies: Int) {
-        toast("Mengirim dokumen...")
+    private fun showPrintProgress(text: String) {
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(24), dp(20), dp(24), dp(8))
+        }
+
+        val bar = ProgressBar(this)
+        val msg = TextView(this).apply {
+            this.text = text
+            textSize = 15f
+        }
+
+        box.addView(bar, LinearLayout.LayoutParams(dp(36), dp(36)))
+        box.addView(
+            msg,
+            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                .apply { marginStart = dp(16) }
+        )
+
+        printBar = bar
+        printMessage = msg
+        printDialog = AlertDialog.Builder(this)
+            .setTitle("Cetak")
+            .setView(box)
+            .setPositiveButton("Tutup", null)
+            .show()
+    }
+
+    private fun updatePrintProgress(text: String, finished: Boolean) {
+        runOnUiThread {
+            printMessage?.text = text
+            if (finished) printBar?.visibility = View.GONE
+        }
+    }
+
+    private fun submitPrint(
+        uri: Uri,
+        printerId: Int,
+        pin: String,
+        copies: Int,
+        pageRange: String
+    ) {
+        showPrintProgress("Mengirim dokumen...")
 
         Thread {
             val result = try {
-                PrintClient.submit(this, uri, pin, printerId, copies)
+                PrintClient.submit(this, uri, pin, printerId, copies, pageRange)
             } catch (e: Exception) {
                 PrintResult(false, "Gagal mengirim: ${e.message}")
             }
 
             if (!result.ok) {
-                runOnUiThread { toast(result.message) }
+                updatePrintProgress(result.message, true)
                 return@Thread
             }
 
@@ -472,31 +597,36 @@ class MainActivity : Activity() {
             getSharedPreferences("print", MODE_PRIVATE)
                 .edit().putString("pin", pin).apply()
 
-            runOnUiThread { toast("Masuk antrean: ${result.printerName}") }
+            updatePrintProgress("Masuk antrean: ${result.printerName}", false)
 
             val token = result.statusToken
-            if (token != null) pollPrintStatus(token)
+            if (token == null) {
+                updatePrintProgress("Masuk antrean: ${result.printerName}", true)
+                return@Thread
+            }
+
+            pollPrintStatus(token)
         }.start()
     }
 
     // Berjalan di thread background: cek status tiap 3 detik, maksimal 90 detik.
     private fun pollPrintStatus(token: String) {
-        val inProgress = setOf("pending", "processing", "printing")
-        var last = "pending"
+        val inProgress = setOf("pending", "printing")
 
         repeat(30) {
             try {
                 val st = PrintClient.fetchStatus(token)
 
-                if (st.status != last) {
-                    last = st.status
-                    runOnUiThread { toast("Status cetak: ${st.status}") }
-                }
-
-                if (st.status !in inProgress) {
-                    if (st.error != null) {
-                        runOnUiThread { toast("Gagal: ${st.error}") }
-                    }
+                if (st.status in inProgress) {
+                    val label =
+                        if (st.status == "pending") "Menunggu di antrean..."
+                        else "Sedang mencetak..."
+                    updatePrintProgress(label, false)
+                } else {
+                    val label =
+                        if (st.status == "done") "Selesai dicetak"
+                        else "Gagal: ${st.error ?: "printer tidak merespons"}"
+                    updatePrintProgress(label, true)
                     return
                 }
             } catch (e: Exception) {
@@ -504,6 +634,195 @@ class MainActivity : Activity() {
             }
 
             Thread.sleep(3000)
+        }
+
+        updatePrintProgress("Masih diproses server. Cek printer sebentar lagi.", true)
+    }
+
+    // ============================================================
+    // LOMPAT HALAMAN, MODE MALAM
+    // ============================================================
+
+    private fun showJumpDialog() {
+        val total = documentView.pageCount()
+        if (currentUri == null || total == 0) return
+
+        val input = EditText(this).apply {
+            hint = "1 - $total"
+            inputType = InputType.TYPE_CLASS_NUMBER
+            filters = arrayOf(InputFilter.LengthFilter(5))
+        }
+
+        val box = LinearLayout(this).apply {
+            setPadding(dp(20), dp(8), dp(20), 0)
+            addView(input, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ))
+        }
+
+        AlertDialog.Builder(this)
+            .setTitle("Lompat ke halaman")
+            .setView(box)
+            .setPositiveButton("Pergi") { _, _ ->
+                val n = input.text.toString().toIntOrNull()
+
+                if (n == null || n !in 1..total) {
+                    toast("Masukkan angka 1-$total.")
+                    return@setPositiveButton
+                }
+
+                documentView.goToPage(n - 1)
+            }
+            .setNegativeButton("Batal", null)
+            .show()
+    }
+
+    private fun toggleNightMode() {
+        nightMode = !nightMode
+
+        getSharedPreferences("settings", MODE_PRIVATE)
+            .edit().putBoolean("night", nightMode).apply()
+
+        documentView.setNightMode(nightMode)
+    }
+
+    // ============================================================
+    // BERANDA: DAFTAR PDF TERAKHIR
+    // ============================================================
+
+    private fun refreshHome() {
+        homeList.removeAllViews()
+
+        homeList.addView(TextView(this).apply {
+            text = "MARSA PDF Reader"
+            textSize = 20f
+            setTextColor(textColor)
+            typeface = Typeface.DEFAULT_BOLD
+        })
+
+        val openButton = TextView(this).apply {
+            text = "Buka PDF"
+            textSize = 15f
+            gravity = Gravity.CENTER
+            setTextColor(Color.WHITE)
+            typeface = Typeface.DEFAULT_BOLD
+            background = GradientDrawable().apply {
+                setColor(accent)
+                cornerRadius = dp(12).toFloat()
+            }
+            setOnClickListener { choosePdf() }
+        }
+        homeList.addView(
+            openButton,
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(48))
+                .apply { topMargin = dp(16) }
+        )
+
+        val recents = RecentStore.load(this)
+
+        val label = TextView(this).apply {
+            text =
+                if (recents.isEmpty()) "Belum ada PDF yang pernah dibuka."
+                else "PDF terakhir"
+            textSize = 13f
+            setTextColor(Color.LTGRAY)
+        }
+        homeList.addView(
+            label,
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply {
+                topMargin = dp(24)
+                bottomMargin = dp(8)
+            }
+        )
+
+        val fmt = SimpleDateFormat("d MMM yyyy, HH:mm", Locale("id", "ID"))
+
+        for (item in recents) {
+            homeList.addView(
+                buildRecentRow(item, fmt),
+                LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply { bottomMargin = dp(10) }
+            )
+        }
+    }
+
+    private fun buildRecentRow(item: RecentPdf, fmt: SimpleDateFormat): View {
+        val uri = Uri.parse(item.uri)
+
+        val card = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(14), dp(12), dp(8), dp(4))
+            background = GradientDrawable().apply {
+                setColor(surface)
+                cornerRadius = dp(14).toFloat()
+            }
+            setOnClickListener { openPdf(uri) }
+        }
+
+        card.addView(TextView(this).apply {
+            text = item.name
+            textSize = 15f
+            setTextColor(textColor)
+            typeface = Typeface.DEFAULT_BOLD
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.MIDDLE
+        })
+
+        card.addView(TextView(this).apply {
+            text = "Halaman ${item.page + 1} \u2022 ${fmt.format(Date(item.time))}"
+            textSize = 12f
+            setTextColor(Color.LTGRAY)
+        })
+
+        val actions = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.END
+        }
+
+        fun action(label: String, color: Int, onClick: () -> Unit) {
+            actions.addView(TextView(this).apply {
+                text = label
+                textSize = 13f
+                setTextColor(color)
+                typeface = Typeface.DEFAULT_BOLD
+                setPadding(dp(12), dp(10), dp(12), dp(10))
+                setOnClickListener { onClick() }
+            })
+        }
+
+        action("Buka", accent) { openPdf(uri) }
+        action("Cetak", textColor) { startPrintFlow(uri) }
+        action("Bagikan", textColor) { sharePdf(uri) }
+        action("Hapus", Color.rgb(255, 120, 120)) {
+            try {
+                contentResolver.releasePersistableUriPermission(
+                    uri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION
+                )
+            } catch (_: Exception) {
+            }
+            RecentStore.remove(this, item.uri)
+            refreshHome()
+        }
+
+        card.addView(actions)
+        return card
+    }
+
+    private fun saveLastPage() {
+        val uri = currentUri ?: return
+        if (documentView.pageCount() > 0) {
+            RecentStore.updatePage(
+                this,
+                uri.toString(),
+                documentView.currentPageIndex()
+            )
         }
     }
 
@@ -615,10 +934,19 @@ class MainActivity : Activity() {
 
             documentView.setRenderer(pdf)
             emptyView.visibility = View.GONE
-            fileNameView.text = getDisplayName(uri)
+            val displayName = getDisplayName(uri)
+            fileNameView.text = displayName
+
+            RecentStore.touch(this, uri.toString(), displayName)
+
+            val lastPage = RecentStore.pageOf(this, uri.toString())
+            if (lastPage > 0) {
+                documentView.post { documentView.goToPage(lastPage) }
+            }
 
             Toast.makeText(this, "PDF berhasil dibuka", Toast.LENGTH_SHORT).show()
         } catch (e: Exception) {
+            RecentStore.remove(this, uri.toString())
             closePdf()
             Toast.makeText(
                 this,
@@ -629,6 +957,10 @@ class MainActivity : Activity() {
     }
 
     private fun closePdf() {
+        if (::documentView.isInitialized) {
+            saveLastPage()
+        }
+
         // Lepas renderer dari view DULU supaya onDraw tidak memakai renderer yang ditutup.
         if (::documentView.isInitialized) {
             documentView.setRenderer(null)
@@ -644,8 +976,14 @@ class MainActivity : Activity() {
         if (::fileNameView.isInitialized) {
             fileNameView.text = "MARSA PDF Reader"
         }
+        if (::pageView.isInitialized) {
+            pageView.visibility = View.GONE
+        }
         if (::emptyView.isInitialized) {
             emptyView.visibility = View.VISIBLE
+        }
+        if (::homeList.isInitialized) {
+            refreshHome()
         }
     }
 
@@ -653,8 +991,8 @@ class MainActivity : Activity() {
     // SHARE
     // ============================================================
 
-    private fun sharePdf() {
-        val uri = currentUri
+    private fun sharePdf(target: Uri? = currentUri) {
+        val uri = target
         if (uri == null) {
             Toast.makeText(
                 this,
@@ -683,6 +1021,21 @@ class MainActivity : Activity() {
     // ============================================================
     // LIFECYCLE
     // ============================================================
+
+    @Deprecated("Deprecated in Java")
+    override fun onBackPressed() {
+        if (currentUri != null) {
+            closePdf()
+        } else {
+            @Suppress("DEPRECATION")
+            super.onBackPressed()
+        }
+    }
+
+    override fun onPause() {
+        saveLastPage()
+        super.onPause()
+    }
 
     override fun onDestroy() {
         closePdf()
