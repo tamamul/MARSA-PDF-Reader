@@ -1,9 +1,12 @@
+
 package com.marsa.pdfreader
 
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.ColorMatrix
+import android.graphics.ColorMatrixColorFilter
 import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.RectF
@@ -108,6 +111,40 @@ class PdfDocumentView(context: Context) : View(context) {
         Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.WHITE
         }
+
+    // Mode malam: warna halaman dibalik (putih jadi abu gelap).
+    private var nightMode = false
+
+    // Slider scroll cepat di tepi kanan.
+    private val thumbPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.argb(210, 67, 133, 255)
+    }
+    private val bubblePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.argb(235, 27, 35, 50)
+    }
+    private val bubbleText = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.WHITE
+        textSize = dp(14).toFloat()
+        textAlign = Paint.Align.CENTER
+    }
+    private val thumbW = dp(6).toFloat()
+    private val thumbH = dp(56).toFloat()
+    private val edgeZone = dp(32).toFloat()
+    private val thumbRect = RectF()
+    private val bubbleRect = RectF()
+    private var thumbVisible = false
+    private var draggingThumb = false
+
+    private val hideThumb = Runnable {
+        if (!draggingThumb) {
+            thumbVisible = false
+            invalidate()
+        }
+    }
+
+    // Dipanggil saat halaman di tengah layar berganti: (indeks, total).
+    var onPageChanged: ((Int, Int) -> Unit)? = null
+    private var reportedPage = -1
 
     private val scaleDetector =
         ScaleGestureDetector(
@@ -232,6 +269,7 @@ class PdfDocumentView(context: Context) : View(context) {
             pendingRenders.clear()
             bitmapCache.evictAll()
             clearHiRegions()
+            reportedPage = -1
 
             pageSizes.clear()
 
@@ -530,7 +568,9 @@ class PdfDocumentView(context: Context) : View(context) {
 
         super.onDraw(canvas)
 
-        canvas.drawColor(Color.rgb(35, 42, 55))
+        canvas.drawColor(
+            if (nightMode) Color.rgb(12, 14, 18) else Color.rgb(35, 42, 55)
+        )
 
         if (pageSizes.isEmpty()) return
 
@@ -544,6 +584,7 @@ class PdfDocumentView(context: Context) : View(context) {
 
         var firstVisible = -1
         var lastVisible = -1
+        var middlePage = -1
 
         for (i in pageSizes.indices) {
 
@@ -555,6 +596,13 @@ class PdfDocumentView(context: Context) : View(context) {
             )
 
             val bottom = top + scaledHeight
+
+            if (
+                middlePage == -1 &&
+                bottom + pageGap * zoom / 2f >= height / 2f
+            ) {
+                middlePage = i
+            }
 
             if (bottom >= 0f) {
 
@@ -632,6 +680,89 @@ class PdfDocumentView(context: Context) : View(context) {
             trimHiRegions(firstVisible, lastVisible)
             scheduleHiRes()
         }
+
+        if (middlePage == -1) middlePage = pageSizes.lastIndex
+
+        if (middlePage != reportedPage) {
+            reportedPage = middlePage
+            val page = middlePage
+            post { onPageChanged?.invoke(page, pageSizes.size) }
+        }
+
+        drawFastScroll(canvas, middlePage)
+    }
+
+    private fun drawFastScroll(canvas: Canvas, middlePage: Int) {
+
+        if (!thumbVisible && !draggingThumb) return
+
+        val max = maxScroll()
+        if (max <= 0) return
+
+        val y = (scrollOffset / max).coerceIn(0f, 1f) * (height - thumbH)
+        val right = width - dp(4).toFloat()
+
+        thumbRect.set(right - thumbW, y, right, y + thumbH)
+        canvas.drawRoundRect(thumbRect, thumbW / 2f, thumbW / 2f, thumbPaint)
+
+        if (draggingThumb) {
+            val label = "${middlePage + 1} / ${pageSizes.size}"
+            val tw = bubbleText.measureText(label) + dp(24)
+            val bh = dp(36).toFloat()
+            val cy = y + thumbH / 2f
+
+            bubbleRect.set(
+                thumbRect.left - dp(12) - tw,
+                cy - bh / 2f,
+                thumbRect.left - dp(12),
+                cy + bh / 2f
+            )
+
+            canvas.drawRoundRect(bubbleRect, bh / 2f, bh / 2f, bubblePaint)
+            canvas.drawText(
+                label,
+                bubbleRect.centerX(),
+                cy + bubbleText.textSize / 3f,
+                bubbleText
+            )
+        }
+    }
+
+    private fun flashThumb() {
+        thumbVisible = true
+        mainHandler.removeCallbacks(hideThumb)
+        mainHandler.postDelayed(hideThumb, 1200L)
+    }
+
+    private fun startThumbDrag(event: MotionEvent): Boolean {
+
+        if (
+            event.x > width - edgeZone &&
+            maxScroll() > 0 &&
+            (thumbVisible || zoom <= 1.05f)
+        ) {
+            draggingThumb = true
+            thumbVisible = true
+            mainHandler.removeCallbacks(hideThumb)
+            parent?.requestDisallowInterceptTouchEvent(true)
+            dragThumbTo(event.y)
+            return true
+        }
+
+        return false
+    }
+
+    private fun dragThumbTo(y: Float) {
+        val frac = ((y - thumbH / 2f) / (height - thumbH)).coerceIn(0f, 1f)
+        scrollOffset = frac * maxScroll()
+        clampScroll()
+        invalidate()
+    }
+
+    private fun endThumbDrag() {
+        draggingThumb = false
+        flashThumb()
+        invalidate()
     }
 
     // ==================================================
@@ -823,6 +954,7 @@ class PdfDocumentView(context: Context) : View(context) {
             scrollOffset = scroller.currY.toFloat()
 
             clampScroll()
+            flashThumb()
 
             postInvalidateOnAnimation()
         }
@@ -846,6 +978,8 @@ class PdfDocumentView(context: Context) : View(context) {
             MotionEvent.ACTION_DOWN -> {
 
                 scroller.abortAnimation()
+
+                if (startThumbDrag(event)) return true
 
                 velocityTracker?.recycle()
 
@@ -871,6 +1005,11 @@ class PdfDocumentView(context: Context) : View(context) {
 
             MotionEvent.ACTION_MOVE -> {
 
+                if (draggingThumb) {
+                    dragThumbTo(event.y)
+                    return true
+                }
+
                 velocityTracker?.addMovement(event)
 
                 if (
@@ -892,6 +1031,7 @@ class PdfDocumentView(context: Context) : View(context) {
                     scrollOffset -= dy
 
                     clampScroll()
+                    flashThumb()
 
                     postInvalidateOnAnimation()
                 }
@@ -917,6 +1057,11 @@ class PdfDocumentView(context: Context) : View(context) {
             }
 
             MotionEvent.ACTION_UP -> {
+
+                if (draggingThumb) {
+                    endThumbDrag()
+                    return true
+                }
 
                 velocityTracker?.addMovement(event)
 
@@ -967,6 +1112,8 @@ class PdfDocumentView(context: Context) : View(context) {
 
             MotionEvent.ACTION_CANCEL -> {
 
+                if (draggingThumb) endThumbDrag()
+
                 velocityTracker?.recycle()
                 velocityTracker = null
 
@@ -985,38 +1132,124 @@ class PdfDocumentView(context: Context) : View(context) {
         super.performClick()
         return true
     }
-    
-    fun currentPageIndex(): Int {
-    if (pageSizes.isEmpty()) return 0
-    val scaledWidth = basePageWidth() * zoom
-    val middle = height / 2f
-    var top = pageGap * zoom - scrollOffset
-    for (i in pageSizes.indices) {
-        val bottom = top + pageHeight(i, scaledWidth)
-        if (middle <= bottom + pageGap * zoom / 2f) return i
-        top = bottom + pageGap * zoom
-    }
-    return pageSizes.lastIndex
-}
 
-fun renderPageForExport(index: Int, targetWidth: Int): Bitmap? {
-    synchronized(rendererLock) {
-        val renderer = pdf ?: return null
-        if (index !in pageSizes.indices) return null
-        val page = renderer.openPage(index)
-        try {
-            val ratio = page.height.toFloat() / page.width.toFloat()
-            var w = targetWidth
-            if (w * ratio > 4096f) w = (4096f / ratio).toInt()
-            w = w.coerceAtLeast(1)
-            val h = (w * ratio).toInt().coerceAtLeast(1)
-            val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-            bmp.eraseColor(Color.WHITE)
-            page.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
-            return bmp
-        } finally { page.close() }
+    // ==================================================
+    // MODE MALAM, LOMPAT HALAMAN
+    // ==================================================
+
+    fun setNightMode(enabled: Boolean) {
+
+        nightMode = enabled
+
+        pagePaint.colorFilter =
+            if (enabled) {
+                // putih -> abu gelap (24), hitam -> abu terang (225)
+                ColorMatrixColorFilter(
+                    ColorMatrix(
+                        floatArrayOf(
+                            -0.79f, 0f, 0f, 0f, 225f,
+                            0f, -0.79f, 0f, 0f, 225f,
+                            0f, 0f, -0.79f, 0f, 225f,
+                            0f, 0f, 0f, 1f, 0f
+                        )
+                    )
+                )
+            } else {
+                null
+            }
+
+        placeholderPaint.color =
+            if (enabled) Color.rgb(24, 24, 24) else Color.WHITE
+
+        invalidate()
     }
-}
+
+    fun pageCount(): Int = pageSizes.size
+
+    fun goToPage(index: Int) {
+
+        if (pageSizes.isEmpty()) return
+
+        val target = index.coerceIn(0, pageSizes.lastIndex)
+        val scaledWidth = basePageWidth() * zoom
+
+        var offset = 0f
+
+        for (j in 0 until target) {
+            offset += pageHeight(j, scaledWidth) + pageGap * zoom
+        }
+
+        scroller.abortAnimation()
+        scrollOffset = offset
+        clampScroll()
+        invalidate()
+    }
+
+    // ==================================================
+    // EXPORT HALAMAN KE GAMBAR
+    // ==================================================
+
+    // Halaman yang sedang berada di tengah layar.
+    fun currentPageIndex(): Int {
+
+        if (pageSizes.isEmpty()) return 0
+
+        val scaledWidth = basePageWidth() * zoom
+        val middle = height / 2f
+
+        var top = pageGap * zoom - scrollOffset
+
+        for (i in pageSizes.indices) {
+
+            val bottom = top + pageHeight(i, scaledWidth)
+
+            if (middle <= bottom + pageGap * zoom / 2f) return i
+
+            top = bottom + pageGap * zoom
+        }
+
+        return pageSizes.lastIndex
+    }
+
+    // Panggil dari thread background, bukan thread UI.
+    fun renderPageForExport(index: Int, targetWidth: Int): Bitmap? {
+
+        synchronized(rendererLock) {
+
+            val renderer = pdf ?: return null
+
+            if (index !in pageSizes.indices) return null
+
+            val page = renderer.openPage(index)
+
+            try {
+
+                val ratio = page.height.toFloat() / page.width.toFloat()
+
+                // Sisi terpanjang dibatasi 4096 px agar tidak kehabisan memori.
+                var w = targetWidth
+                if (w * ratio > 4096f) w = (4096f / ratio).toInt()
+                w = w.coerceAtLeast(1)
+
+                val h = (w * ratio).toInt().coerceAtLeast(1)
+
+                val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                bmp.eraseColor(Color.WHITE)
+
+                page.render(
+                    bmp,
+                    null,
+                    null,
+                    PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY
+                )
+
+                return bmp
+
+            } finally {
+                page.close()
+            }
+        }
+    }
 
     // ==================================================
     // RELEASE
