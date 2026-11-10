@@ -8,7 +8,12 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.util.UUID
 
-data class PrintPrinter(val id: Int, val name: String, val location: String)
+data class PrintPrinter(
+    val id: Int,
+    val name: String,
+    val location: String,
+    val online: Boolean = true
+)
 
 data class PrintResult(
     val ok: Boolean,
@@ -22,7 +27,6 @@ data class PrintStatus(val status: String, val error: String?)
 // Klien API cetak guru. Semua fungsi memblokir: panggil dari thread background.
 object PrintClient {
 
-    // GANTI dengan domain server print Anda (wajib https).
     private const val BASE_URL = "https://chat.marsa9.com/printserver-ci4/public"
 
     private fun open(path: String, method: String): HttpURLConnection {
@@ -49,7 +53,7 @@ object PrintClient {
     }
 
     fun fetchPrinters(): List<PrintPrinter> {
-        val c = open("/api/teacher/printers", "GET")
+        val c = open("/api/teacher/printers?all=1", "GET")
         try {
             val json = parseJson(readBody(c))
 
@@ -64,7 +68,8 @@ object PrintClient {
                 PrintPrinter(
                     o.getInt("id"),
                     o.optString("nama_printer"),
-                    o.optString("lokasi")
+                    o.optString("lokasi"),
+                    o.optString("agent_status", "online") == "online"
                 )
             }
         } finally {
@@ -78,7 +83,8 @@ object PrintClient {
         uri: Uri,
         pin: String,
         printerId: Int,
-        copies: Int
+        copies: Int,
+        pageRange: String = ""
     ): PrintResult {
 
         val boundary = "----marsa" + UUID.randomUUID().toString().replace("-", "")
@@ -105,6 +111,10 @@ object PrintClient {
                 field("pin", pin)
                 field("printer_id", printerId.toString())
                 field("jumlah_copy", copies.toString())
+
+                if (pageRange.isNotBlank()) {
+                    field("page_range", pageRange)
+                }
 
                 out.writeBytes(
                     "--$boundary\r\n" +
